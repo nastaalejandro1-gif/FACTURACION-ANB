@@ -198,11 +198,13 @@ async def _timbre_and_deliver(
     chat_id: str,
     message_id: int,
 ) -> None:
+    facturapi_key = client_profile.facturapi_key if client_profile else ""
+
     try:
-        result = await create_invoice(invoice_data)
+        result = await create_invoice(invoice_data, facturapi_key)
         folio = result.get("id", "")
-        pdf_bytes = await download_pdf(folio)
-        xml_bytes = await download_xml(folio)
+        pdf_bytes = await download_pdf(folio, facturapi_key)
+        xml_bytes = await download_xml(folio, facturapi_key)
     except httpx.TimeoutException:
         error_msg = "timeout al conectar con FacturAPI"
         logger.error("FacturAPI timeout para %s", invoice_id)
@@ -313,9 +315,20 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"Error al leer datos de la factura: {exc}")
         return
 
+    # Retrieve the client profile to get their FacturAPI key
+    canal = str(pending.get("canal", "telegram"))
+    client_profile = sheets_client.get_client_by_canal_id(canal, client_canal_id)
+    if not client_profile:
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"⚠️ No encontré el perfil del cliente (canal_id: {client_canal_id}). "
+            "No se puede timbrar sin la API key de FacturAPI."
+        )
+        return
+
     sheets_client.update_pending_status(pending["row_index"], "aprobado")
     await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⏳ Timbrando factura {invoice_id}...")
-    await _timbre_and_deliver(invoice_id, invoice_data, None, client_canal_id, 0)
+    await _timbre_and_deliver(invoice_id, invoice_data, client_profile, client_canal_id, 0)
 
 
 # ---------------------------------------------------------------------------

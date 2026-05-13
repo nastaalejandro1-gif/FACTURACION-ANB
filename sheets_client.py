@@ -86,6 +86,7 @@ def get_client_by_canal_id(canal: str, canal_id: str) -> Optional[ClientProfile]
                 requiere_revision=str(row.get("Requiere_revision", "NO")).upper() == "SI",
                 notas_fiscales=str(row.get("Notas_fiscales", "")),
                 activo=True,
+                facturapi_key=str(row.get("Facturapi_key", "")),
             )
     return None
 

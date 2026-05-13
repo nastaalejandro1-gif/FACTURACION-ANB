@@ -102,3 +102,4 @@ class ClientProfile(BaseModel):
     requiere_revision: bool
     notas_fiscales: str
     activo: bool
+    facturapi_key: str  # API key de la organización del cliente en FacturAPI
