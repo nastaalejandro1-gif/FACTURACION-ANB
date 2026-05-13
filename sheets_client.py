@@ -1,0 +1,309 @@
+import asyncio
+import base64
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+import gspread
+from google.oauth2.service_account import Credentials
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from config import GOOGLE_CREDENTIALS_JSON, GOOGLE_SHEETS_ID, DESPACHO_ID
+from models import ClientProfile
+
+logger = logging.getLogger(__name__)
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# Per-channel locks — prevents concurrent history writes for the same user
+_channel_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_channel_lock(canal_id: str) -> asyncio.Lock:
+    if canal_id not in _channel_locks:
+        _channel_locks[canal_id] = asyncio.Lock()
+    return _channel_locks[canal_id]
+
+
+def _build_client() -> gspread.Client:
+    creds_dict = json.loads(base64.b64decode(GOOGLE_CREDENTIALS_JSON))
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+
+def _get_sheet(name: str) -> gspread.Worksheet:
+    gc = _build_client()
+    spreadsheet = gc.open_by_key(GOOGLE_SHEETS_ID)
+    return spreadsheet.worksheet(name)
+
+
+# ---------------------------------------------------------------------------
+# Retry decorator for Sheets API quota errors
+# ---------------------------------------------------------------------------
+
+_sheets_retry = retry(
+    retry=retry_if_exception_type(gspread.exceptions.APIError),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    stop=stop_after_attempt(4),
+    reraise=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Client profile
+# ---------------------------------------------------------------------------
+
+@_sheets_retry
+def get_client_by_canal_id(canal: str, canal_id: str) -> Optional[ClientProfile]:
+    ws = _get_sheet("Clientes")
+    records = ws.get_all_records()
+
+    canal_id_str = str(int(float(canal_id)))  # normalize: "7963818260.0" → "7963818260"
+
+    for row in records:
+        if (
+            str(row.get("canal", "")).lower() == canal.lower()
+            and str(int(float(str(row.get("canal_id", "0"))))) == canal_id_str
+            and str(row.get("activo", "NO")).upper() == "SI"
+        ):
+            return ClientProfile(
+                despacho_id=str(row["despacho_id"]),
+                id_cliente=str(row["ID_cliente"]),
+                nombre_comercial=str(row["Nombre_comercial"]),
+                razon_social=str(row["Razon_social"]),
+                rfc=str(row["RFC"]),
+                canal=str(row["canal"]),
+                canal_id=canal_id_str,
+                email_factura=str(row["Email_factura"]),
+                tipo_persona=str(row["Tipo_persona"]),
+                regimen_fiscal=str(row["Regimen_fiscal"]),
+                cp_fiscal=str(row["CP_fiscal"]),
+                iva_aplica=str(row["IVA_aplica"]),
+                retencion_iva=float(row.get("Retencion_IVA", 0) or 0),
+                retencion_isr=float(row.get("Retencion_ISR", 0) or 0),
+                clave_prod_serv_default=str(row.get("Clave_prod_serv_default", "")),
+                requiere_revision=str(row.get("Requiere_revision", "NO")).upper() == "SI",
+                notas_fiscales=str(row.get("Notas_fiscales", "")),
+                activo=True,
+            )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Conversation history
+# ---------------------------------------------------------------------------
+
+def _content_to_serializable(content) -> str:
+    """Convert message content (str or list of SDK blocks) to a JSON string."""
+    if isinstance(content, str):
+        return content
+    # List of content blocks (may include TextBlock, ToolUseBlock, ToolResultBlock)
+    blocks = []
+    for block in content:
+        if hasattr(block, "model_dump"):
+            blocks.append(block.model_dump())
+        elif isinstance(block, dict):
+            blocks.append(block)
+        else:
+            blocks.append({"type": "text", "text": str(block)})
+    return json.dumps(blocks)
+
+
+def _content_from_serializable(raw: str):
+    """Reconstruct content from what was stored in Sheets."""
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return raw  # plain string message
+
+
+def strip_binary_from_messages(messages: list) -> list:
+    """Replace image/document content blocks with a text marker before saving to Sheets."""
+    cleaned = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            new_blocks = []
+            for block in content:
+                block_dict = block.model_dump() if hasattr(block, "model_dump") else block
+                if isinstance(block_dict, dict) and block_dict.get("type") in ("image", "document"):
+                    new_blocks.append({"type": "text", "text": "[CSF adjunta — datos extraídos]"})
+                else:
+                    new_blocks.append(block_dict)
+            cleaned.append({"role": msg["role"], "content": new_blocks})
+        else:
+            cleaned.append(msg)
+    return cleaned
+
+
+def strip_binary_in_place(messages: list) -> list:
+    """Strip binary from in-memory history after extraction (before 2nd Claude call)."""
+    return strip_binary_from_messages(messages)
+
+
+@_sheets_retry
+def load_history(canal_id: str) -> list:
+    ws = _get_sheet("Conversaciones")
+    canal_id_str = str(int(float(canal_id)))
+    records = ws.get_all_records()
+    for row in records:
+        if str(int(float(str(row.get("canal_id", "0"))))) == canal_id_str:
+            raw = row.get("historial", "[]")
+            try:
+                msgs = json.loads(raw)
+                return [
+                    {"role": m["role"], "content": _content_from_serializable(m["content"])}
+                    for m in msgs
+                ]
+            except Exception:
+                return []
+    return []
+
+
+@_sheets_retry
+def save_history(canal: str, canal_id: str, messages: list) -> None:
+    ws = _get_sheet("Conversaciones")
+    canal_id_str = str(int(float(canal_id)))
+
+    # Serialize — strip binary first, then convert blocks to dicts
+    cleaned = strip_binary_from_messages(messages)
+    serialized = [
+        {"role": m["role"], "content": _content_to_serializable(m["content"])}
+        for m in cleaned
+    ]
+    historial_json = json.dumps(serialized, ensure_ascii=False)
+
+    # Enforce cell size limit: keep last N messages if over 45K chars
+    while len(historial_json) > 45_000 and len(serialized) > 4:
+        serialized = serialized[2:]  # drop oldest pair
+        historial_json = json.dumps(serialized, ensure_ascii=False)
+
+    now = datetime.now(timezone.utc).isoformat()
+    records = ws.get_all_records()
+
+    for i, row in enumerate(records, start=2):  # row 1 = header
+        if str(int(float(str(row.get("canal_id", "0"))))) == canal_id_str:
+            ws.update(f"D{i}", [[historial_json]])
+            ws.update(f"E{i}", [[now]])
+            return
+
+    # New client — append row
+    ws.append_row([DESPACHO_ID, canal, canal_id_str, historial_json, now])
+
+
+# ---------------------------------------------------------------------------
+# Pendientes (approval queue)
+# ---------------------------------------------------------------------------
+
+@_sheets_retry
+def save_pending(
+    invoice_id: str,
+    canal: str,
+    canal_id: str,
+    telegram_message_id: int,
+    invoice_json: str,
+    motivo_revision: str,
+) -> None:
+    ws = _get_sheet("Pendientes")
+    now = datetime.now(timezone.utc).isoformat()
+    ws.append_row([
+        invoice_id,
+        DESPACHO_ID,
+        canal,
+        canal_id,
+        telegram_message_id,
+        invoice_json,
+        motivo_revision,
+        now,
+        "pendiente",
+        "",  # timestamp_respuesta
+    ])
+
+
+@_sheets_retry
+def get_pending(invoice_id: str) -> Optional[dict]:
+    ws = _get_sheet("Pendientes")
+    records = ws.get_all_records()
+    for i, row in enumerate(records, start=2):
+        if str(row.get("id", "")) == invoice_id:
+            return {"row_index": i, **row}
+    return None
+
+
+@_sheets_retry
+def update_pending_status(row_index: int, estado: str) -> None:
+    ws = _get_sheet("Pendientes")
+    now = datetime.now(timezone.utc).isoformat()
+    ws.update(f"I{row_index}", [[estado]])
+    ws.update(f"J{row_index}", [[now]])
+
+
+@_sheets_retry
+def get_overdue_pending(hours: int = 24) -> list[dict]:
+    """Return pending invoices older than `hours` hours."""
+    from datetime import timedelta
+    ws = _get_sheet("Pendientes")
+    records = ws.get_all_records()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    overdue = []
+    for row in records:
+        if str(row.get("estado", "")) == "pendiente":
+            ts_str = str(row.get("timestamp", ""))
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts < cutoff:
+                    overdue.append(row)
+            except ValueError:
+                pass
+    return overdue
+
+
+@_sheets_retry
+def is_message_already_processed(telegram_message_id: int) -> bool:
+    """Check Pendientes and Bitacora for an existing entry with this message_id."""
+    ws = _get_sheet("Pendientes")
+    records = ws.get_all_records()
+    msg_id_str = str(telegram_message_id)
+    return any(
+        str(row.get("telegram_message_id", "")) == msg_id_str
+        for row in records
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bitácora
+# ---------------------------------------------------------------------------
+
+@_sheets_retry
+def log_to_bitacora(
+    invoice_id: str,
+    canal_id: str,
+    rfc_emisor: str,
+    rfc_receptor: str,
+    monto: float,
+    total: float,
+    requirio_revision: bool,
+    estado: str,
+    folio_fiscal: str = "",
+    error_detalle: str = "",
+) -> None:
+    ws = _get_sheet("Bitacora")
+    now = datetime.now(timezone.utc).isoformat()
+    ws.append_row([
+        invoice_id,
+        DESPACHO_ID,
+        str(int(float(canal_id))),
+        rfc_emisor,
+        rfc_receptor,
+        monto,
+        total,
+        "SI" if requirio_revision else "NO",
+        estado,
+        folio_fiscal,
+        now,
+        error_detalle,
+    ])

@@ -1,0 +1,10 @@
+import os
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:TEST")
+os.environ.setdefault("TELEGRAM_WEBHOOK_SECRET", "test-secret")
+os.environ.setdefault("ALEJANDRO_CHAT_ID", "999999999")
+os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test")
+os.environ.setdefault("FACTURAPI_KEY", "test-key")
+os.environ.setdefault("GOOGLE_SHEETS_ID", "sheet-id")
+os.environ.setdefault("GOOGLE_CREDENTIALS_JSON", "e30=")  # base64("{}")
+os.environ.setdefault("CRON_SECRET", "cron-secret-test")
+os.environ.setdefault("DESPACHO_ID", "ANB-001")
