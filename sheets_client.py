@@ -1,15 +1,15 @@
 import asyncio
-import base64
 import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
 import gspread
-from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from config import GOOGLE_CREDENTIALS_JSON, GOOGLE_SHEETS_ID, DESPACHO_ID
+from config import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_SHEETS_ID, DESPACHO_ID
 from models import ClientProfile
 
 logger = logging.getLogger(__name__)
@@ -27,8 +27,16 @@ def get_channel_lock(canal_id: str) -> asyncio.Lock:
 
 
 def _build_client() -> gspread.Client:
-    creds_dict = json.loads(base64.b64decode(GOOGLE_CREDENTIALS_JSON))
-    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    creds = Credentials(
+        token=None,
+        refresh_token=GOOGLE_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=SCOPES,
+    )
+    # Refresh to get a valid access token
+    creds.refresh(Request())
     return gspread.authorize(creds)
 
 
