@@ -67,6 +67,10 @@ CLAUDE_TOOLS = [
                             "type": "number",
                             "description": "Suma de cantidad * precio_unitario de todos los conceptos",
                         },
+                        "ieps": {
+                            "type": "number",
+                            "description": "Monto de IEPS (0 si no aplica). ieps = monto_antes_impuestos * ieps_rate / 100",
+                        },
                         "iva": {"type": "number"},
                         "retencion_iva": {"type": "number"},
                         "retencion_isr": {"type": "number"},

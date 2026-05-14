@@ -47,6 +47,7 @@ class ConceptoItem(BaseModel):
 class FacturaData(BaseModel):
     conceptos: list[ConceptoItem] = Field(min_length=1)
     monto_antes_impuestos: float = Field(gt=0, le=10_000_000)
+    ieps: float = Field(ge=0, default=0)
     iva: float = Field(ge=0)
     retencion_iva: float = Field(ge=0)
     retencion_isr: float = Field(ge=0)
@@ -88,6 +89,7 @@ class FacturaData(BaseModel):
     def validate_total_consistency(self) -> "FacturaData":
         expected = (
             self.monto_antes_impuestos
+            + self.ieps
             + self.iva
             - self.retencion_iva
             - self.retencion_isr
@@ -124,6 +126,7 @@ class ClientProfile(BaseModel):
     iva_aplica: str
     retencion_iva: float
     retencion_isr: float
+    ieps_rate: float
     clave_prod_serv_default: str
     requiere_revision: bool
     notas_fiscales: str

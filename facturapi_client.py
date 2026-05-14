@@ -65,6 +65,14 @@ def _build_facturapi_payload(data: InvoiceData) -> dict:
 def _build_taxes(data: InvoiceData) -> list:
     taxes = []
 
+    if data.factura.ieps > 0:
+        taxes.append({
+            "type": "IEPS",
+            "rate": round(data.factura.ieps / data.factura.monto_antes_impuestos, 6),
+            "factor": "Tasa",
+            "withholding": False,
+        })
+
     if data.factura.iva > 0:
         taxes.append({
             "type": "IVA",

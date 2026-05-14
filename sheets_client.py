@@ -113,6 +113,7 @@ def get_client_by_canal_id(canal: str, canal_id: str) -> Optional[ClientProfile]
                 iva_aplica=_get(row, "IVA_aplica"),
                 retencion_iva=_to_float(_get(row, "Retencion_IVA", "0")),
                 retencion_isr=_to_float(_get(row, "Retencion_ISR", "0")),
+                ieps_rate=_to_float(_get(row, "IEPS_rate", "0")),
                 clave_prod_serv_default=_get(row, "Clave_prod_serv_default"),
                 requiere_revision=_get(row, "Requiere_revision", "NO").upper() == "SI",
                 notas_fiscales=_get(row, "Notas_fiscales"),

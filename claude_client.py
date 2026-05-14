@@ -89,13 +89,17 @@ FLUJO PRINCIPAL:
 6. Muestra resumen completo con todos los conceptos y pide confirmación explícita.
 7. Al confirmar, llama a generate_invoice_data con todos los datos.
 
-REGLAS FISCALES RESICO (régimen 621):
-- IVA: 16% sobre el subtotal. SIEMPRE calcula iva = monto_antes_impuestos * 0.16 cuando IVA aplica = {profile.iva_aplica}. Nunca pongas iva = 0 si IVA aplica = SÍ.
-- Si el receptor es Persona Moral (PM): aplica retenciones según el perfil del emisor.
-  - Retención IVA: {profile.retencion_iva}% sobre el IVA (iva * {profile.retencion_iva} / 100).
-  - Retención ISR: {profile.retencion_isr}% sobre el subtotal (monto_antes_impuestos * {profile.retencion_isr} / 100).
-- Si el receptor es Persona Física (PF): sin retenciones.
-- total_estimado = monto_antes_impuestos + iva - retencion_iva - retencion_isr.
+REGLAS FISCALES:
+- IEPS: {"APLICA — tasa " + str(profile.ieps_rate) + "%" if profile.ieps_rate > 0 else "NO aplica (ieps = 0)"}
+  {"- ieps = monto_antes_impuestos * " + str(profile.ieps_rate) + " / 100" if profile.ieps_rate > 0 else ""}
+- IVA: {"16% sobre (monto_antes_impuestos + ieps). iva = (monto_antes_impuestos + ieps) * 0.16" if profile.ieps_rate > 0 else "16% sobre el subtotal. iva = monto_antes_impuestos * 0.16"}
+  {"" if profile.iva_aplica == "SÍ" or profile.iva_aplica == "SI" else "IVA aplica = " + profile.iva_aplica + " — revisa antes de aplicar."}
+  NUNCA pongas iva = 0 si IVA aplica = {profile.iva_aplica}.
+- Retenciones (solo si receptor es Persona Moral):
+  - Retención IVA: {profile.retencion_iva}% del IVA → iva * {profile.retencion_iva} / 100.
+  - Retención ISR: {profile.retencion_isr}% del subtotal → monto_antes_impuestos * {profile.retencion_isr} / 100.
+- Si receptor es Persona Física: sin retenciones.
+- total_estimado = monto_antes_impuestos + ieps + iva - retencion_iva - retencion_isr.
 
 REGLA PPD: Si metodo_pago = "PPD", la forma_pago DEBE ser "99" (Por Definir). Es obligatorio por el SAT. No preguntes la forma de pago si el cliente elige PPD.
 
