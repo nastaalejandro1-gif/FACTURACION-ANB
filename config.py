@@ -3,6 +3,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Validate required variables on startup and report which are missing
+_REQUIRED = [
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_WEBHOOK_SECRET",
+    "ALEJANDRO_CHAT_ID",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_SHEETS_ID",
+    "GOOGLE_CLIENT_ID",
+    "GOOGLE_CLIENT_SECRET",
+    "GOOGLE_REFRESH_TOKEN",
+    "CRON_SECRET",
+]
+_missing = [v for v in _REQUIRED if not os.environ.get(v)]
+if _missing:
+    raise RuntimeError(f"Variables de entorno faltantes: {', '.join(_missing)}")
+
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_WEBHOOK_SECRET = os.environ["TELEGRAM_WEBHOOK_SECRET"]
 ALEJANDRO_CHAT_ID = int(os.environ["ALEJANDRO_CHAT_ID"])
