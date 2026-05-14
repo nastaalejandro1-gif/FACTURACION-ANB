@@ -35,3 +35,7 @@ GOOGLE_REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"]
 
 DESPACHO_ID = os.environ.get("DESPACHO_ID", "ANB-001")
 CRON_SECRET = os.environ["CRON_SECRET"]
+
+# Resend (opcional — si no está configurado, el email se omite silenciosamente)
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "Facturación ANB <facturas@anb-consultores.com>")

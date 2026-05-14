@@ -12,6 +12,7 @@ from claude_client import run_conversation_turn
 from config import ALEJANDRO_CHAT_ID, CRON_SECRET, TELEGRAM_WEBHOOK_SECRET
 from facturapi_client import create_invoice, download_pdf, download_xml
 from models import InvoiceData
+from resend_client import send_invoice_email
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -246,13 +247,20 @@ async def _timbre_and_deliver(
         )
         return
 
-    # Éxito
+    # Éxito — entregar por Telegram y por email
     await telegram_client.send_document(
         chat_id, pdf_bytes, f"factura_{invoice_id[:8]}.pdf",
         caption=f"✅ Tu factura ha sido timbrada. Folio: {folio}"
     )
     await telegram_client.send_document(
         chat_id, xml_bytes, f"factura_{invoice_id[:8]}.xml"
+    )
+    await send_invoice_email(
+        to_email=client_profile.email_factura,
+        nombre_comercial=client_profile.nombre_comercial,
+        folio=folio,
+        pdf_bytes=pdf_bytes,
+        xml_bytes=xml_bytes,
     )
     sheets_client.log_to_bitacora(
         invoice_id=invoice_id, canal_id=chat_id,
