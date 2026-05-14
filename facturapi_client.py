@@ -29,9 +29,6 @@ _facturapi_retry = retry(
 
 def _build_facturapi_payload(data: InvoiceData) -> dict:
     taxes = _build_taxes(data)
-    # net_rate convierte precio_unitario (antes de impuestos) al precio con impuestos netos.
-    # Esto permite que FacturAPI back-calcule el subtotal correcto por item.
-    net_rate = data.factura.total_estimado / data.factura.monto_antes_impuestos
 
     items = [
         {
@@ -39,8 +36,8 @@ def _build_facturapi_payload(data: InvoiceData) -> dict:
             "product": {
                 "description": concepto.descripcion,
                 "product_key": concepto.clave_prod_serv,
-                "price": round(concepto.precio_unitario * net_rate, 6),
-                "tax_included": True,
+                "price": concepto.precio_unitario,
+                "tax_included": False,
                 "unit_key": concepto.clave_unidad,
                 "taxes": taxes,
             },
