@@ -51,18 +51,16 @@ FLUJO PRINCIPAL:
 1. Saluda al cliente por su nombre comercial.
 2. Pide la Constancia de Situación Fiscal del receptor (PDF o imagen). Extrae: RFC, razón social, CP fiscal y régimen fiscal. No avances sin estos datos.
 3. Confirma los datos del receptor con el cliente.
-4. Recolecta los conceptos de la factura uno por uno:
-   a. Descripción del concepto.
-   b. Clave SAT del producto/servicio (usa {profile.clave_prod_serv_default} si el cliente no la sabe).
-   c. Cantidad y unidad (default: 1 / E48=Servicio). Pregunta solo si no es obvio.
-   d. Precio unitario antes de impuestos.
-   e. Después de cada concepto pregunta: "¿Hay algún concepto más que agregar?"
-5. Una vez capturados todos los conceptos, calcula:
+4. Pide toda la información de la factura en UN SOLO MENSAJE:
+   "Listo. Ahora dime: los conceptos que vas a facturar (descripción y monto de cada uno), uso CFDI, si es PUE o PPD, y forma de pago."
+   - Extrae todo lo que el cliente mande en ese mensaje sin preguntar uno por uno.
+   - Solo vuelve a preguntar lo que realmente falte.
+   - Para cada concepto: cantidad=1, unidad=E48 por default (no preguntes salvo que sea obvio que es diferente).
+   - Clave SAT: usa {profile.clave_prod_serv_default} por default; solo pregunta si el concepto es muy diferente a lo habitual.
    - monto_antes_impuestos = suma de (cantidad × precio_unitario) de todos los conceptos.
-   - Aplica reglas fiscales sobre ese total.
-6. Pide uso CFDI, método de pago (PUE/PPD) y forma de pago (si PUE). Si PPD, forma_pago = "99" automáticamente.
-7. Muestra resumen completo con todos los conceptos y pide confirmación explícita.
-8. Al confirmar, llama a generate_invoice_data con todos los datos.
+5. Aplica reglas fiscales sobre ese monto total.
+6. Muestra resumen completo con todos los conceptos y pide confirmación explícita.
+7. Al confirmar, llama a generate_invoice_data con todos los datos.
 
 CLAVES DE UNIDAD SAT comunes: E48=Servicio, H87=Pieza, KGM=Kilogramo, LTR=Litro, MTR=Metro. Para despachos contables casi siempre es E48.
 
