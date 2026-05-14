@@ -45,9 +45,28 @@ CLAUDE_TOOLS = [
                 "factura": {
                     "type": "object",
                     "properties": {
-                        "concepto": {"type": "string"},
-                        "clave_prod_serv": {"type": "string"},
-                        "monto_antes_impuestos": {"type": "number"},
+                        "conceptos": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "descripcion": {"type": "string"},
+                                    "clave_prod_serv": {"type": "string"},
+                                    "cantidad": {"type": "number"},
+                                    "clave_unidad": {
+                                        "type": "string",
+                                        "description": "Clave SAT: E48=Servicio, H87=Pieza, KGM=Kilogramo, LTR=Litro, MTR=Metro",
+                                    },
+                                    "precio_unitario": {"type": "number"},
+                                },
+                                "required": ["descripcion", "clave_prod_serv", "cantidad", "clave_unidad", "precio_unitario"],
+                            },
+                        },
+                        "monto_antes_impuestos": {
+                            "type": "number",
+                            "description": "Suma de cantidad * precio_unitario de todos los conceptos",
+                        },
                         "iva": {"type": "number"},
                         "retencion_iva": {"type": "number"},
                         "retencion_isr": {"type": "number"},
@@ -57,7 +76,7 @@ CLAUDE_TOOLS = [
                         "observaciones": {"type": "string", "default": ""},
                     },
                     "required": [
-                        "concepto", "clave_prod_serv", "monto_antes_impuestos",
+                        "conceptos", "monto_antes_impuestos",
                         "iva", "retencion_iva", "retencion_isr", "total_estimado",
                         "metodo_pago", "forma_pago",
                     ],

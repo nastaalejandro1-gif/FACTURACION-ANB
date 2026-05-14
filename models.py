@@ -36,9 +36,16 @@ class ReceptorData(BaseModel):
         return v
 
 
-class FacturaData(BaseModel):
-    concepto: str
+class ConceptoItem(BaseModel):
+    descripcion: str
     clave_prod_serv: str
+    cantidad: float = Field(gt=0, default=1.0)
+    clave_unidad: str = "E48"  # E48=Servicio (default despachos contables)
+    precio_unitario: float = Field(gt=0)
+
+
+class FacturaData(BaseModel):
+    conceptos: list[ConceptoItem] = Field(min_length=1)
     monto_antes_impuestos: float = Field(gt=0, le=10_000_000)
     iva: float = Field(ge=0)
     retencion_iva: float = Field(ge=0)
@@ -57,6 +64,16 @@ class FacturaData(BaseModel):
                 f"03=Transferencia, 04=Tarjeta, 01=Efectivo, etc."
             )
         return v
+
+    @model_validator(mode="after")
+    def validate_monto_conceptos(self) -> "FacturaData":
+        suma = sum(c.cantidad * c.precio_unitario for c in self.conceptos)
+        if abs(suma - self.monto_antes_impuestos) > self.monto_antes_impuestos * 0.01:
+            raise ValueError(
+                f"monto_antes_impuestos ({self.monto_antes_impuestos:.2f}) no coincide con "
+                f"la suma de conceptos ({suma:.2f}). Diferencia > 1%."
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_ppd_forma_pago(self) -> "FacturaData":

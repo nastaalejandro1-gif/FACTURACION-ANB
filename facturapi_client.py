@@ -28,16 +28,25 @@ _facturapi_retry = retry(
 
 
 def _build_facturapi_payload(data: InvoiceData) -> dict:
-    items = [{
-        "quantity": 1,
-        "product": {
-            "description": data.factura.concepto,
-            "product_key": data.factura.clave_prod_serv,
-            "price": data.factura.total_estimado,
-            "tax_included": True,
-            "taxes": _build_taxes(data),
-        },
-    }]
+    taxes = _build_taxes(data)
+    # net_rate convierte precio_unitario (antes de impuestos) al precio con impuestos netos.
+    # Esto permite que FacturAPI back-calcule el subtotal correcto por item.
+    net_rate = data.factura.total_estimado / data.factura.monto_antes_impuestos
+
+    items = [
+        {
+            "quantity": concepto.cantidad,
+            "product": {
+                "description": concepto.descripcion,
+                "product_key": concepto.clave_prod_serv,
+                "price": round(concepto.precio_unitario * net_rate, 6),
+                "tax_included": True,
+                "unit_key": concepto.clave_unidad,
+                "taxes": taxes,
+            },
+        }
+        for concepto in data.factura.conceptos
+    ]
 
     # SAT rule: PPD always requires forma_pago = 99 (Por Definir)
     forma_pago = "99" if data.factura.metodo_pago == "PPD" else data.factura.forma_pago
