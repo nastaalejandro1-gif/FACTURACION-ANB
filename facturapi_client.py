@@ -33,10 +33,14 @@ def _build_facturapi_payload(data: InvoiceData) -> dict:
         "product": {
             "description": data.factura.concepto,
             "product_key": data.factura.clave_prod_serv,
-            "price": data.factura.monto_antes_impuestos,
+            "price": data.factura.total_estimado,
+            "tax_included": True,
             "taxes": _build_taxes(data),
         },
     }]
+
+    # SAT rule: PPD always requires forma_pago = 99 (Por Definir)
+    forma_pago = "99" if data.factura.metodo_pago == "PPD" else data.factura.forma_pago
 
     return {
         "customer": {
@@ -46,7 +50,7 @@ def _build_facturapi_payload(data: InvoiceData) -> dict:
             "address": {"zip": data.receptor.cp_fiscal},
         },
         "items": items,
-        "payment_form": data.factura.forma_pago,
+        "payment_form": forma_pago,
         "payment_method": data.factura.metodo_pago,
         "use": data.receptor.uso_cfdi,
     }
@@ -66,7 +70,7 @@ def _build_taxes(data: InvoiceData) -> list:
     if data.factura.retencion_iva > 0:
         taxes.append({
             "type": "IVA",
-            "rate": round(data.factura.retencion_iva / (data.factura.iva if data.factura.iva else 1), 6),
+            "rate": round(data.factura.retencion_iva / data.factura.monto_antes_impuestos, 6),
             "factor": "Tasa",
             "withholding": True,
         })
@@ -94,6 +98,7 @@ async def create_invoice(invoice_data: InvoiceData, facturapi_key: str) -> dict:
         raise ValueError("El cliente no tiene configurada una API key de FacturAPI en Google Sheets.")
 
     payload = _build_facturapi_payload(invoice_data)
+    logger.info("FacturAPI payload: %s", payload)
     headers = {"Authorization": f"Bearer {facturapi_key}"}
 
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:

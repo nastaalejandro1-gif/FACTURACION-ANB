@@ -59,6 +59,15 @@ class FacturaData(BaseModel):
         return v
 
     @model_validator(mode="after")
+    def validate_ppd_forma_pago(self) -> "FacturaData":
+        if self.metodo_pago == "PPD" and self.forma_pago != "99":
+            raise ValueError(
+                "Para método de pago PPD la forma de pago debe ser '99' (Por Definir). "
+                f"Se recibió '{self.forma_pago}'."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_total_consistency(self) -> "FacturaData":
         expected = (
             self.monto_antes_impuestos

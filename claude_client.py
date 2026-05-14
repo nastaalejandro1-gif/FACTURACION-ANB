@@ -57,11 +57,14 @@ FLUJO PRINCIPAL:
 7. Al confirmar, llama a generate_invoice_data con todos los datos.
 
 REGLAS FISCALES RESICO (régimen 621):
-- IVA: 16% sobre el subtotal.
+- IVA: 16% sobre el subtotal. SIEMPRE calcula iva = monto_antes_impuestos * 0.16 cuando IVA aplica = {profile.iva_aplica}. Nunca pongas iva = 0 si IVA aplica = SÍ.
 - Si el receptor es Persona Moral (PM): aplica retenciones según el perfil del emisor.
-  - Retención IVA: {profile.retencion_iva}% sobre el IVA.
-  - Retención ISR: {profile.retencion_isr}% sobre el subtotal.
+  - Retención IVA: {profile.retencion_iva}% sobre el IVA (iva * {profile.retencion_iva} / 100).
+  - Retención ISR: {profile.retencion_isr}% sobre el subtotal (monto_antes_impuestos * {profile.retencion_isr} / 100).
 - Si el receptor es Persona Física (PF): sin retenciones.
+- total_estimado = monto_antes_impuestos + iva - retencion_iva - retencion_isr.
+
+REGLA PPD: Si metodo_pago = "PPD", la forma_pago DEBE ser "99" (Por Definir). Es obligatorio por el SAT. No preguntes la forma de pago si el cliente elige PPD.
 
 CASOS QUE REQUIEREN REVISIÓN (requiere_revision: true):
 - No se proporcionó CSF o datos del receptor incompletos.
