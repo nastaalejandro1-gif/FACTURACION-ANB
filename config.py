@@ -10,7 +10,6 @@ ALEJANDRO_CHAT_ID = int(os.environ["ALEJANDRO_CHAT_ID"])
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
-FACTURAPI_KEY = os.environ["FACTURAPI_KEY"]
 FACTURAPI_BASE_URL = "https://www.facturapi.io/v2"
 
 GOOGLE_SHEETS_ID = os.environ["GOOGLE_SHEETS_ID"]

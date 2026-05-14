@@ -59,6 +59,29 @@ _sheets_retry = retry(
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _to_float(value) -> float:
+    """Convierte un valor de Sheets a float, tolerando % y celdas vacías."""
+    try:
+        return float(str(value).replace("%", "").strip() or 0)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _get(row: dict, key: str, default="") -> str:
+    """Lookup case-insensitive en el dict de gspread."""
+    if key in row:
+        return str(row[key])
+    key_lower = key.lower()
+    for k, v in row.items():
+        if k.lower() == key_lower:
+            return str(v)
+    return str(default)
+
+
+# ---------------------------------------------------------------------------
 # Client profile
 # ---------------------------------------------------------------------------
 
@@ -71,30 +94,30 @@ def get_client_by_canal_id(canal: str, canal_id: str) -> Optional[ClientProfile]
 
     for row in records:
         if (
-            str(row.get("canal", "")).lower() == canal.lower()
-            and str(int(float(str(row.get("canal_id", "0"))))) == canal_id_str
-            and str(row.get("activo", "NO")).upper() == "SI"
+            _get(row, "canal").lower() == canal.lower()
+            and str(int(float(_get(row, "canal_id", "0") or "0"))) == canal_id_str
+            and _get(row, "activo", "NO").upper() == "SI"
         ):
             return ClientProfile(
-                despacho_id=str(row["despacho_id"]),
-                id_cliente=str(row["ID_cliente"]),
-                nombre_comercial=str(row["Nombre_comercial"]),
-                razon_social=str(row["Razon_social"]),
-                rfc=str(row["RFC"]),
-                canal=str(row["canal"]),
+                despacho_id=_get(row, "despacho_id"),
+                id_cliente=_get(row, "ID_cliente"),
+                nombre_comercial=_get(row, "Nombre_comercial"),
+                razon_social=_get(row, "Razon_social"),
+                rfc=_get(row, "RFC"),
+                canal=_get(row, "canal"),
                 canal_id=canal_id_str,
-                email_factura=str(row["Email_factura"]),
-                tipo_persona=str(row["Tipo_persona"]),
-                regimen_fiscal=str(row["Regimen_fiscal"]),
-                cp_fiscal=str(row["CP_fiscal"]),
-                iva_aplica=str(row["IVA_aplica"]),
-                retencion_iva=float(row.get("Retencion_IVA", 0) or 0),
-                retencion_isr=float(row.get("Retencion_ISR", 0) or 0),
-                clave_prod_serv_default=str(row.get("Clave_prod_serv_default", "")),
-                requiere_revision=str(row.get("Requiere_revision", "NO")).upper() == "SI",
-                notas_fiscales=str(row.get("Notas_fiscales", "")),
+                email_factura=_get(row, "Email_factura"),
+                tipo_persona=_get(row, "Tipo_persona"),
+                regimen_fiscal=_get(row, "Regimen_fiscal"),
+                cp_fiscal=_get(row, "CP_fiscal"),
+                iva_aplica=_get(row, "IVA_aplica"),
+                retencion_iva=_to_float(_get(row, "Retencion_IVA", "0")),
+                retencion_isr=_to_float(_get(row, "Retencion_ISR", "0")),
+                clave_prod_serv_default=_get(row, "Clave_prod_serv_default"),
+                requiere_revision=_get(row, "Requiere_revision", "NO").upper() == "SI",
+                notas_fiscales=_get(row, "Notas_fiscales"),
                 activo=True,
-                facturapi_key=str(row.get("Facturapi_key", "")),
+                facturapi_key=_get(row, "Facturapi_key"),
             )
     return None
 
