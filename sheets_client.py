@@ -213,6 +213,16 @@ def save_history(canal: str, canal_id: str, messages: list) -> None:
     # Enforce cell size limit: keep last N messages if over 45K chars
     while len(historial_json) > 45_000 and len(serialized) > 4:
         serialized = serialized[2:]  # drop oldest pair
+        # Drop any leading tool_result messages orphaned after the trim
+        while serialized:
+            content = serialized[0].get("content", [])
+            if isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in content
+            ):
+                serialized = serialized[1:]
+            else:
+                break
         historial_json = json.dumps(serialized, ensure_ascii=False)
 
     now = datetime.now(timezone.utc).isoformat()

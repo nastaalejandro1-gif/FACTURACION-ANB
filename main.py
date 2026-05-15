@@ -123,6 +123,17 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
         )
 
     except Exception as exc:
+        error_str = str(exc)
+        # Historial corrupto (tool_result sin tool_use correspondiente) — limpiar y pedir reintento
+        if "tool_use_id" in error_str and "tool_result" in error_str:
+            logger.warning("Historial corrupto para %s — limpiando y pidiendo reintento", chat_id)
+            history.clear()
+            await telegram_client.send_message(
+                chat_id,
+                "Tuve un problema con nuestra conversación anterior. Ya está resuelto — por favor vuelve a enviar tu mensaje. 🔄"
+            )
+            return
+
         logger.exception("Error en conversación para chat_id %s", chat_id)
         await telegram_client.send_message(chat_id, "Ocurrió un error inesperado. El despacho ha sido notificado.")
         await telegram_client.send_message(
