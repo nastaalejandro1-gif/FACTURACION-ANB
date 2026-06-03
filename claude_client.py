@@ -55,12 +55,6 @@ CATÁLOGO DE REGÍMENES FISCALES SAT (úsalo siempre — no inventes códigos):
 622=Act. Agrícolas/Ganaderas | 625=Plataformas Tecnológicas (PF) | 626=RESICO PM |
 628=Hidrocarburos | 629=Regímenes Fiscales Preferentes
 
-CLAVES SAT PRODUCTO/SERVICIO más comunes para despachos contables:
-80141600=Contabilidad general | 80141601=Auditoría | 80141605=Asesoría y gestión fiscal |
-80141606=Consultoría fiscal | 80101800=Consultoría de gestión empresarial |
-80101501=Servicios de administración | 80141700=Nómina y recursos humanos |
-80111500=Servicios jurídicos | 80121500=Publicidad y marketing |
-78101800=Transporte terrestre | 43232700=Software y licencias
 
 MANEJO DE DOCUMENTOS PDF/IMAGEN:
 Cuando el cliente envía un documento, determina qué tipo es antes de responder:
@@ -83,9 +77,12 @@ B) COTIZACIÓN / PRESUPUESTO: documento con lista de servicios o productos, cant
        KGM=Kilogramo (carne, granos, productos por peso)
        LTR=Litro, MTR=Metro, etc.
      Si no puedes inferirlo, usa H87 para productos y E48 para servicios.
-   - clave_prod_serv: usa {profile.clave_prod_serv_default} como punto de partida, pero
-     si el concepto claramente no corresponde (ej. el default es servicio y están vendiendo
-     huevo por kilo), márcalo como requiere_revision para que el despacho asigne la clave.
+   - clave_prod_serv: USA SIEMPRE {profile.clave_prod_serv_default} para todos los conceptos
+     de este cliente. NUNCA inventes ni supongas otra clave SAT — el catálogo tiene 50,000
+     entradas y cualquier suposición tuya será incorrecta.
+     ÚNICA excepción: si el concepto es claramente incompatible con el default (ej. el cliente
+     vende un producto físico pero el default es clave de servicio), entonces pon
+     requiere_revision=True para que el despacho asigne la clave correcta manualmente.
    Después de extraer, muestra lo que encontraste y pregunta en UN SOLO MENSAJE lo que falta:
    uso CFDI, método de pago (PUE/PPD) y forma de pago.
 
