@@ -26,22 +26,7 @@ app = FastAPI(title="ANB Billing Agent")
 
 @app.get("/health")
 def health():
-    import os
-    key = os.environ.get("SUPABASE_SERVICE_KEY", "")
-    url = os.environ.get("SUPABASE_URL", "")
-    try:
-        from sheets_client import _get_supabase
-        sb = _get_supabase()
-        sb.table("clientes").select("id").limit(1).execute()
-        supabase_status = "ok"
-    except Exception as e:
-        supabase_status = str(e)[:200]
-    return {
-        "status": "ok",
-        "supabase": supabase_status,
-        "key_prefix": key[:20] if key else "MISSING",
-        "url": url or "MISSING",
-    }
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
