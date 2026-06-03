@@ -323,7 +323,7 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
     client_canal_id = str(pending["canal_id"])
 
     if command == "/rechazar":
-        sheets_client.update_pending_status(pending["row_index"], "rechazado")
+        sheets_client.update_pending_status(pending["id"], "rechazado")
         await telegram_client.send_message(
             client_canal_id,
             "Tu solicitud de factura no pudo procesarse. El despacho te contactará para más información."
@@ -356,7 +356,7 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
         )
         return
 
-    sheets_client.update_pending_status(pending["row_index"], "aprobado")
+    sheets_client.update_pending_status(pending["id"], "aprobado")
     await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⏳ Timbrando factura {invoice_id}...")
     await _timbre_and_deliver(invoice_id, invoice_data, client_profile, client_canal_id, 0)
 

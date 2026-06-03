@@ -1,23 +1,25 @@
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-import gspread
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from supabase import create_client, Client
 
-from config import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GOOGLE_SHEETS_ID, DESPACHO_ID
+from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, DESPACHO_ID
 from models import ClientProfile
 
 logger = logging.getLogger(__name__)
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-# Per-channel locks — prevents concurrent history writes for the same user
+_supabase_client: Optional[Client] = None
 _channel_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_supabase() -> Client:
+    global _supabase_client
+    if _supabase_client is None:
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    return _supabase_client
 
 
 def get_channel_lock(canal_id: str) -> asyncio.Lock:
@@ -26,112 +28,20 @@ def get_channel_lock(canal_id: str) -> asyncio.Lock:
     return _channel_locks[canal_id]
 
 
-def _build_client() -> gspread.Client:
-    creds = Credentials(
-        token=None,
-        refresh_token=GOOGLE_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=SCOPES,
-    )
-    # Refresh to get a valid access token
-    creds.refresh(Request())
-    return gspread.authorize(creds)
-
-
-def _get_sheet(name: str) -> gspread.Worksheet:
-    gc = _build_client()
-    spreadsheet = gc.open_by_key(GOOGLE_SHEETS_ID)
-    return spreadsheet.worksheet(name)
-
-
-# ---------------------------------------------------------------------------
-# Retry decorator for Sheets API quota errors
-# ---------------------------------------------------------------------------
-
-_sheets_retry = retry(
-    retry=retry_if_exception_type(gspread.exceptions.APIError),
-    wait=wait_exponential(multiplier=1, min=2, max=30),
-    stop=stop_after_attempt(4),
-    reraise=True,
-)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _to_float(value) -> float:
-    """Convierte un valor de Sheets a float, tolerando % y celdas vacías."""
     try:
         return float(str(value).replace("%", "").strip() or 0)
     except (ValueError, TypeError):
         return 0.0
 
 
-def _get(row: dict, key: str, default="") -> str:
-    """Lookup case-insensitive en el dict de gspread."""
-    if key in row:
-        return str(row[key])
-    key_lower = key.lower()
-    for k, v in row.items():
-        if k.lower() == key_lower:
-            return str(v)
-    return str(default)
-
-
 # ---------------------------------------------------------------------------
-# Client profile
-# ---------------------------------------------------------------------------
-
-@_sheets_retry
-def get_client_by_canal_id(canal: str, canal_id: str) -> Optional[ClientProfile]:
-    ws = _get_sheet("Clientes")
-    records = ws.get_all_records()
-
-    canal_id_str = str(int(float(canal_id)))  # normalize: "7963818260.0" → "7963818260"
-
-    for row in records:
-        if (
-            _get(row, "canal").lower() == canal.lower()
-            and str(int(float(_get(row, "canal_id", "0") or "0"))) == canal_id_str
-            and _get(row, "activo", "NO").upper() == "SI"
-        ):
-            return ClientProfile(
-                despacho_id=_get(row, "despacho_id"),
-                id_cliente=_get(row, "ID_cliente"),
-                nombre_comercial=_get(row, "Nombre_comercial"),
-                razon_social=_get(row, "Razon_social"),
-                rfc=_get(row, "RFC"),
-                canal=_get(row, "canal"),
-                canal_id=canal_id_str,
-                email_factura=_get(row, "Email_factura"),
-                tipo_persona=_get(row, "Tipo_persona"),
-                regimen_fiscal=_get(row, "Regimen_fiscal"),
-                cp_fiscal=_get(row, "CP_fiscal"),
-                iva_aplica=_get(row, "IVA_aplica"),
-                retencion_iva=_to_float(_get(row, "Retencion_IVA", "0")),
-                retencion_isr=_to_float(_get(row, "Retencion_ISR", "0")),
-                ieps_rate=_to_float(_get(row, "IEPS_rate", "0")),
-                clave_prod_serv_default=_get(row, "Clave_prod_serv_default"),
-                requiere_revision=_get(row, "Requiere_revision", "NO").upper() == "SI",
-                notas_fiscales=_get(row, "Notas_fiscales"),
-                activo=True,
-                facturapi_key=_get(row, "Facturapi_key"),
-            )
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Conversation history
+# History serialization helpers (unchanged)
 # ---------------------------------------------------------------------------
 
 def _content_to_serializable(content) -> str:
-    """Convert message content (str or list of SDK blocks) to a JSON string."""
     if isinstance(content, str):
         return content
-    # List of content blocks (may include TextBlock, ToolUseBlock, ToolResultBlock)
     blocks = []
     for block in content:
         if hasattr(block, "model_dump"):
@@ -144,18 +54,16 @@ def _content_to_serializable(content) -> str:
 
 
 def _content_from_serializable(raw: str):
-    """Reconstruct content from what was stored in Sheets."""
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, list):
             return parsed
     except (json.JSONDecodeError, TypeError):
         pass
-    return raw  # plain string message
+    return raw
 
 
 def strip_binary_from_messages(messages: list) -> list:
-    """Replace image/document content blocks with a text marker before saving to Sheets."""
     cleaned = []
     for msg in messages:
         content = msg.get("content", "")
@@ -174,35 +82,87 @@ def strip_binary_from_messages(messages: list) -> list:
 
 
 def strip_binary_in_place(messages: list) -> list:
-    """Strip binary from in-memory history after extraction (before 2nd Claude call)."""
     return strip_binary_from_messages(messages)
 
 
-@_sheets_retry
+# ---------------------------------------------------------------------------
+# Client profile
+# ---------------------------------------------------------------------------
+
+def get_client_by_canal_id(canal: str, canal_id: str) -> Optional[ClientProfile]:
+    sb = _get_supabase()
+    canal_id_str = str(int(float(canal_id)))
+
+    result = (
+        sb.table("clientes")
+        .select("*")
+        .eq("canal", canal.lower())
+        .eq("canal_id", canal_id_str)
+        .eq("activo", True)
+        .execute()
+    )
+
+    if not result.data:
+        return None
+
+    row = result.data[0]
+    return ClientProfile(
+        despacho_id=row.get("despacho_id", ""),
+        id_cliente=str(row.get("id_cliente", "")),
+        nombre_comercial=row.get("nombre_comercial", ""),
+        razon_social=row.get("razon_social", ""),
+        rfc=row.get("rfc", ""),
+        canal=row.get("canal", ""),
+        canal_id=canal_id_str,
+        email_factura=row.get("email_factura", ""),
+        tipo_persona=row.get("tipo_persona", "PF"),
+        regimen_fiscal=str(row.get("regimen_fiscal", "")),
+        cp_fiscal=str(row.get("cp_fiscal", "")),
+        iva_aplica=row.get("iva_aplica", "SI"),
+        retencion_iva=_to_float(row.get("retencion_iva", 0)),
+        retencion_isr=_to_float(row.get("retencion_isr", 0)),
+        ieps_rate=_to_float(row.get("ieps_rate", 0)),
+        clave_prod_serv_default=str(row.get("clave_prod_serv_default", "")),
+        requiere_revision=bool(row.get("requiere_revision", False)),
+        notas_fiscales=row.get("notas_fiscales", ""),
+        activo=True,
+        facturapi_key=row.get("facturapi_key", ""),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Conversation history
+# ---------------------------------------------------------------------------
+
 def load_history(canal_id: str) -> list:
-    ws = _get_sheet("Conversaciones")
+    sb = _get_supabase()
     canal_id_str = str(int(float(canal_id)))
-    records = ws.get_all_records()
-    for row in records:
-        if str(int(float(str(row.get("canal_id", "0"))))) == canal_id_str:
-            raw = row.get("historial", "[]")
-            try:
-                msgs = json.loads(raw)
-                return [
-                    {"role": m["role"], "content": _content_from_serializable(m["content"])}
-                    for m in msgs
-                ]
-            except Exception:
-                return []
-    return []
+
+    result = (
+        sb.table("conversaciones")
+        .select("historial")
+        .eq("canal_id", canal_id_str)
+        .execute()
+    )
+
+    if not result.data:
+        return []
+
+    raw = result.data[0].get("historial", "[]")
+    try:
+        msgs = json.loads(raw)
+        return [
+            {"role": m["role"], "content": _content_from_serializable(m["content"])}
+            for m in msgs
+        ]
+    except Exception:
+        return []
 
 
-@_sheets_retry
 def save_history(canal: str, canal_id: str, messages: list) -> None:
-    ws = _get_sheet("Conversaciones")
+    sb = _get_supabase()
     canal_id_str = str(int(float(canal_id)))
 
-    # Serialize — strip binary first, then convert blocks to dicts
     cleaned = strip_binary_from_messages(messages)
     serialized = [
         {"role": m["role"], "content": _content_to_serializable(m["content"])}
@@ -210,10 +170,9 @@ def save_history(canal: str, canal_id: str, messages: list) -> None:
     ]
     historial_json = json.dumps(serialized, ensure_ascii=False)
 
-    # Enforce cell size limit: keep last N messages if over 45K chars
+    # Keep last N messages if approaching Supabase text column limits
     while len(historial_json) > 45_000 and len(serialized) > 4:
-        serialized = serialized[2:]  # drop oldest pair
-        # Drop any leading tool_result messages orphaned after the trim
+        serialized = serialized[2:]
         while serialized:
             content = serialized[0].get("content", [])
             if isinstance(content, list) and any(
@@ -226,23 +185,22 @@ def save_history(canal: str, canal_id: str, messages: list) -> None:
         historial_json = json.dumps(serialized, ensure_ascii=False)
 
     now = datetime.now(timezone.utc).isoformat()
-    records = ws.get_all_records()
-
-    for i, row in enumerate(records, start=2):  # row 1 = header
-        if str(int(float(str(row.get("canal_id", "0"))))) == canal_id_str:
-            ws.update(f"D{i}", [[historial_json]])
-            ws.update(f"E{i}", [[now]])
-            return
-
-    # New client — append row
-    ws.append_row([DESPACHO_ID, canal, canal_id_str, historial_json, now])
+    sb.table("conversaciones").upsert(
+        {
+            "despacho_id": DESPACHO_ID,
+            "canal": canal,
+            "canal_id": canal_id_str,
+            "historial": historial_json,
+            "ultima_actualizacion": now,
+        },
+        on_conflict="canal,canal_id",
+    ).execute()
 
 
 # ---------------------------------------------------------------------------
 # Pendientes (approval queue)
 # ---------------------------------------------------------------------------
 
-@_sheets_retry
 def save_pending(
     invoice_id: str,
     canal: str,
@@ -251,77 +209,67 @@ def save_pending(
     invoice_json: str,
     motivo_revision: str,
 ) -> None:
-    ws = _get_sheet("Pendientes")
+    sb = _get_supabase()
     now = datetime.now(timezone.utc).isoformat()
-    ws.append_row([
-        invoice_id,
-        DESPACHO_ID,
-        canal,
-        canal_id,
-        telegram_message_id,
-        invoice_json,
-        motivo_revision,
-        now,
-        "pendiente",
-        "",  # timestamp_respuesta
-    ])
+    sb.table("pendientes").insert(
+        {
+            "id": invoice_id,
+            "despacho_id": DESPACHO_ID,
+            "canal": canal,
+            "canal_id": canal_id,
+            "telegram_message_id": telegram_message_id,
+            "invoice_json": invoice_json,
+            "motivo_revision": motivo_revision,
+            "timestamp": now,
+            "estado": "pendiente",
+        }
+    ).execute()
 
 
-@_sheets_retry
 def get_pending(invoice_id: str) -> Optional[dict]:
-    ws = _get_sheet("Pendientes")
-    records = ws.get_all_records()
-    for i, row in enumerate(records, start=2):
-        if str(row.get("id", "")) == invoice_id:
-            return {"row_index": i, **row}
-    return None
+    sb = _get_supabase()
+    result = sb.table("pendientes").select("*").eq("id", invoice_id).execute()
+    if not result.data:
+        return None
+    return result.data[0]
 
 
-@_sheets_retry
-def update_pending_status(row_index: int, estado: str) -> None:
-    ws = _get_sheet("Pendientes")
+def update_pending_status(invoice_id: str, estado: str) -> None:
+    sb = _get_supabase()
     now = datetime.now(timezone.utc).isoformat()
-    ws.update(f"I{row_index}", [[estado]])
-    ws.update(f"J{row_index}", [[now]])
+    sb.table("pendientes").update(
+        {"estado": estado, "timestamp_respuesta": now}
+    ).eq("id", invoice_id).execute()
 
 
-@_sheets_retry
 def get_overdue_pending(hours: int = 24) -> list[dict]:
-    """Return pending invoices older than `hours` hours."""
-    from datetime import timedelta
-    ws = _get_sheet("Pendientes")
-    records = ws.get_all_records()
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    overdue = []
-    for row in records:
-        if str(row.get("estado", "")) == "pendiente":
-            ts_str = str(row.get("timestamp", ""))
-            try:
-                ts = datetime.fromisoformat(ts_str)
-                if ts < cutoff:
-                    overdue.append(row)
-            except ValueError:
-                pass
-    return overdue
-
-
-@_sheets_retry
-def is_message_already_processed(telegram_message_id: int) -> bool:
-    """Check Pendientes and Bitacora for an existing entry with this message_id."""
-    ws = _get_sheet("Pendientes")
-    records = ws.get_all_records()
-    msg_id_str = str(telegram_message_id)
-    return any(
-        str(row.get("telegram_message_id", "")) == msg_id_str
-        for row in records
+    sb = _get_supabase()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    result = (
+        sb.table("pendientes")
+        .select("*")
+        .eq("estado", "pendiente")
+        .lt("timestamp", cutoff)
+        .execute()
     )
+    return result.data or []
+
+
+def is_message_already_processed(telegram_message_id: int) -> bool:
+    sb = _get_supabase()
+    result = (
+        sb.table("pendientes")
+        .select("id")
+        .eq("telegram_message_id", telegram_message_id)
+        .execute()
+    )
+    return len(result.data) > 0
 
 
 # ---------------------------------------------------------------------------
 # Bitácora
 # ---------------------------------------------------------------------------
 
-@_sheets_retry
 def log_to_bitacora(
     invoice_id: str,
     canal_id: str,
@@ -334,19 +282,21 @@ def log_to_bitacora(
     folio_fiscal: str = "",
     error_detalle: str = "",
 ) -> None:
-    ws = _get_sheet("Bitacora")
+    sb = _get_supabase()
     now = datetime.now(timezone.utc).isoformat()
-    ws.append_row([
-        invoice_id,
-        DESPACHO_ID,
-        str(int(float(canal_id))),
-        rfc_emisor,
-        rfc_receptor,
-        monto,
-        total,
-        "SI" if requirio_revision else "NO",
-        estado,
-        folio_fiscal,
-        now,
-        error_detalle,
-    ])
+    sb.table("bitacora").insert(
+        {
+            "id": invoice_id,
+            "despacho_id": DESPACHO_ID,
+            "canal_id": str(int(float(canal_id))),
+            "rfc_emisor": rfc_emisor,
+            "rfc_receptor": rfc_receptor,
+            "monto": monto,
+            "total": total,
+            "requirio_revision": requirio_revision,
+            "estado": estado,
+            "folio_fiscal": folio_fiscal,
+            "timestamp": now,
+            "error_detalle": error_detalle,
+        }
+    ).execute()
