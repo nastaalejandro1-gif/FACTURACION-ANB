@@ -284,7 +284,7 @@ def log_to_bitacora(
 ) -> None:
     sb = _get_supabase()
     now = datetime.now(timezone.utc).isoformat()
-    sb.table("bitacora").insert(
+    sb.table("bitacora").upsert(
         {
             "id": invoice_id,
             "despacho_id": DESPACHO_ID,
@@ -298,5 +298,6 @@ def log_to_bitacora(
             "folio_fiscal": folio_fiscal,
             "timestamp": now,
             "error_detalle": error_detalle,
-        }
+        },
+        on_conflict="id",
     ).execute()
