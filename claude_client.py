@@ -6,7 +6,7 @@ import anthropic
 from pydantic import ValidationError
 
 from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
-from models import ClientProfile, InvoiceData
+from models import ClientProfile, InvoiceData, RepData
 from sheets_client import strip_binary_in_place
 from tools import CLAUDE_TOOLS
 
@@ -103,15 +103,26 @@ REGLAS FISCALES:
 
 REGLA PPD: Si metodo_pago = "PPD", la forma_pago DEBE ser "99" (Por Definir). Es obligatorio por el SAT. No preguntes la forma de pago si el cliente elige PPD.
 
+FLUJO REP (Recibo Electrónico de Pago / Complemento de Pago):
+Cuando el cliente manda un CFDI (PDF de factura con folio fiscal UUID) avisando que pagó:
+1. Detecta que es un CFDI por su formato (tiene folio fiscal en formato XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX).
+2. Extrae del PDF: UUID/folio fiscal y datos del receptor (razón social, RFC, régimen, CP).
+3. Pregunta en UN SOLO MENSAJE lo que falte entre: fecha de pago y forma de pago real.
+   - Si ya vienen en el mensaje del cliente, NO los preguntes.
+   - Forma de pago: 03=Transferencia, 04=Tarjeta crédito, 28=Tarjeta débito, 01=Efectivo. NO puede ser 99.
+   - Fecha: si solo da día/mes sin hora, usa T12:00:00.
+4. Muestra resumen y pide confirmación.
+5. Al confirmar, llama a generate_rep_data. NUNCA llames generate_invoice_data para un REP.
+
 CASOS QUE REQUIEREN REVISIÓN (requiere_revision: true):
 - No se proporcionó CSF o datos del receptor incompletos.
 - Receptor extranjero o sin RFC.
 - Duda sobre retenciones o IVA.
-- Complemento de pago, cancelación o sustitución.
-- Fecha anterior a hoy.
+- Fecha anterior a hoy (para facturas nuevas).
 - Concepto inusual o fuera de lo habitual.
 - El perfil del cliente tiene "Requiere revisión: SÍ".
 - RESICO en cualquiera de las partes con ambigüedad fiscal.
+- En REP: UUID no identificable, monto parece incorrecto, o receptor no coincide con lo esperado.
 
 REGLAS DE SEGURIDAD:
 - No inventes datos fiscales.
@@ -149,13 +160,12 @@ def run_conversation_turn(
     user_text: Optional[str] = None,
     file_bytes: Optional[bytes] = None,
     media_type: Optional[str] = None,
-) -> tuple[str, Optional[InvoiceData]]:
+) -> tuple[str, Optional[InvoiceData], Optional[RepData]]:
     """
     Run one turn of the conversation.
 
     Returns:
-        (client_message, invoice_data_or_None)
-        invoice_data is set only when Claude calls generate_invoice_data and it passes validation.
+        (client_message, invoice_data_or_None, rep_data_or_None)
     """
     # Build user content
     if file_bytes and media_type:
@@ -193,13 +203,15 @@ def run_conversation_turn(
                 ],
             })
 
-            if tool_name == "generate_invoice_data":
+            if tool_name in ("generate_invoice_data", "generate_rep_data"):
                 # Validate before doing anything fiscal
                 try:
-                    invoice_data = InvoiceData(**tool_input)
+                    if tool_name == "generate_invoice_data":
+                        result_data = InvoiceData(**tool_input)
+                    else:
+                        result_data = RepData(**tool_input)
                 except ValidationError as e:
-                    logger.warning("Validación de InvoiceData falló: %s", e)
-                    # Tell Claude about the validation error so it can fix the data
+                    logger.warning("Validación de %s falló: %s", tool_name, e)
                     history.append({
                         "role": "user",
                         "content": [{
@@ -216,11 +228,10 @@ def run_conversation_turn(
                     if isinstance(msg.get("content"), list):
                         history[i]["content"] = [
                             b if not (isinstance(b, dict) and b.get("type") in ("image", "document"))
-                            else {"type": "text", "text": "[CSF adjunta — datos extraídos]"}
+                            else {"type": "text", "text": "[documento adjunto — datos extraídos]"}
                             for b in msg["content"]
                         ]
 
-                # Tell Claude to continue with the confirmation message
                 history.append({
                     "role": "user",
                     "content": [{
@@ -245,7 +256,10 @@ def run_conversation_turn(
                         for b in final_response.content
                     ],
                 })
-                return client_message, invoice_data
+                if isinstance(result_data, InvoiceData):
+                    return client_message, result_data, None
+                else:
+                    return client_message, None, result_data
 
         else:
             # Regular text response — no tool call
@@ -257,8 +271,8 @@ def run_conversation_turn(
                     for b in response.content
                 ],
             })
-            return client_message, None
+            return client_message, None, None
 
     # Exceeded MAX_TOOL_CYCLES without resolution
     logger.error("Se alcanzó el límite de ciclos tool_use sin resolución")
-    return "Hubo un problema procesando tu solicitud. Por favor contacta al despacho.", None
+    return "Hubo un problema procesando tu solicitud. Por favor contacta al despacho.", None, None

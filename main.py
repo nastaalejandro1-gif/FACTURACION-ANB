@@ -10,8 +10,8 @@ import sheets_client
 import telegram_client
 from claude_client import run_conversation_turn
 from config import ALEJANDRO_CHAT_ID, CRON_SECRET, TELEGRAM_WEBHOOK_SECRET
-from facturapi_client import create_invoice, download_pdf, download_xml
-from models import InvoiceData
+from facturapi_client import create_invoice, create_rep, download_pdf, download_xml, search_invoice_by_uuid
+from models import InvoiceData, RepData
 from resend_client import send_invoice_email
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -125,7 +125,7 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
             await telegram_client.send_message(chat_id, "No entendí tu mensaje. ¿En qué te puedo ayudar?")
             return
 
-        client_message, invoice_data = run_conversation_turn(
+        client_message, invoice_data, rep_data = run_conversation_turn(
             profile=client_profile,
             history=history,
             user_text=user_text,
@@ -163,6 +163,8 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
 
     if invoice_data:
         await process_invoice(invoice_data, client_profile, chat_id, message_id)
+    elif rep_data:
+        await process_rep(rep_data, client_profile, chat_id, message_id)
 
 
 async def process_invoice(
@@ -292,6 +294,139 @@ async def _timbre_and_deliver(
         requirio_revision=False, estado="timbrado", folio_fiscal=folio,
     )
     logger.info("Factura timbrada: %s → folio %s", invoice_id, folio)
+
+
+# ---------------------------------------------------------------------------
+# REP (Complemento de Pago)
+# ---------------------------------------------------------------------------
+
+async def process_rep(
+    rep_data: RepData,
+    client_profile,
+    chat_id: str,
+    message_id: int,
+) -> None:
+    invoice_id = str(uuid.uuid4())
+    facturapi_key = client_profile.facturapi_key if client_profile else ""
+
+    if rep_data.requiere_revision:
+        motivo = rep_data.motivo_revision or "REP requiere revisión manual"
+        sheets_client.save_pending(
+            invoice_id=invoice_id,
+            canal="telegram",
+            canal_id=chat_id,
+            telegram_message_id=message_id,
+            invoice_json=rep_data.model_dump_json(),
+            motivo_revision=motivo,
+        )
+        await telegram_client.send_message(
+            chat_id,
+            "Tu complemento de pago está siendo revisado por el despacho. Te notificamos en breve. ✅"
+        )
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"📋 *REP pendiente de revisión*\n"
+            f"Cliente: {client_profile.nombre_comercial}\n"
+            f"ID: {invoice_id}\n"
+            f"UUID origen: {rep_data.uuid_factura_origen}\n"
+            f"Monto pagado: ${rep_data.monto_pagado:,.2f}\n"
+            f"Motivo: {motivo}\n\n"
+            f"/aprobar {invoice_id}\n/rechazar {invoice_id}"
+        )
+        return
+
+    await _timbre_and_deliver_rep(invoice_id, rep_data, client_profile, chat_id, facturapi_key)
+
+
+async def _timbre_and_deliver_rep(
+    invoice_id: str,
+    rep_data: RepData,
+    client_profile,
+    chat_id: str,
+    facturapi_key: str,
+) -> None:
+    # Look up original invoice in FacturAPI to get total and calculate saldo
+    original_invoice = await search_invoice_by_uuid(rep_data.uuid_factura_origen, facturapi_key)
+    if not original_invoice:
+        await telegram_client.send_message(
+            chat_id,
+            "No encontré la factura original en el sistema. El despacho revisará tu complemento de pago."
+        )
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"⚠️ REP: no se encontró UUID {rep_data.uuid_factura_origen} en FacturAPI\n"
+            f"Cliente: {client_profile.nombre_comercial}\nMonto: ${rep_data.monto_pagado:,.2f}"
+        )
+        return
+
+    invoice_total = float(original_invoice.get("total", 0))
+
+    # Determine parcialidad and saldo anterior from previous REPs
+    previous_reps = sheets_client.get_rep_history(rep_data.uuid_factura_origen)
+    if previous_reps:
+        last_rep = previous_reps[-1]
+        imp_saldo_ant = float(last_rep.get("imp_saldo_insoluto") or 0)
+        num_parcialidad = len(previous_reps) + 1
+    else:
+        imp_saldo_ant = invoice_total
+        num_parcialidad = 1
+
+    try:
+        result = await create_rep(rep_data, facturapi_key, num_parcialidad, imp_saldo_ant)
+        folio = result.get("id", "")
+        imp_saldo_insoluto = result.get("_imp_saldo_insoluto", 0.0)
+        pdf_bytes = await download_pdf(folio, facturapi_key)
+        xml_bytes = await download_xml(folio, facturapi_key)
+    except httpx.TimeoutException:
+        await telegram_client.send_message(
+            chat_id,
+            "Tiempo de espera agotado al generar el complemento. El despacho ha sido notificado."
+        )
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"⏱️ Timeout en REP\nCliente: {client_profile.nombre_comercial}\nID: {invoice_id}"
+        )
+        sheets_client.log_to_bitacora(
+            invoice_id=invoice_id, canal_id=chat_id,
+            rfc_emisor=client_profile.rfc, rfc_receptor=rep_data.receptor.rfc,
+            monto=rep_data.monto_pagado, total=rep_data.monto_pagado,
+            requirio_revision=False, estado="error", error_detalle="timeout",
+            tipo="rep", uuid_factura_origen=rep_data.uuid_factura_origen,
+        )
+        return
+    except httpx.HTTPStatusError as exc:
+        error_msg = str(exc)[:500]
+        await telegram_client.send_message(
+            chat_id,
+            "El SAT rechazó el complemento de pago. Tu despacho te contactará."
+        )
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"❌ Error REP FacturAPI\nCliente: {client_profile.nombre_comercial}\n{error_msg}"
+        )
+        sheets_client.log_to_bitacora(
+            invoice_id=invoice_id, canal_id=chat_id,
+            rfc_emisor=client_profile.rfc, rfc_receptor=rep_data.receptor.rfc,
+            monto=rep_data.monto_pagado, total=rep_data.monto_pagado,
+            requirio_revision=False, estado="error", error_detalle=error_msg,
+            tipo="rep", uuid_factura_origen=rep_data.uuid_factura_origen,
+        )
+        return
+
+    await telegram_client.send_document(
+        chat_id, pdf_bytes, f"rep_{invoice_id[:8]}.pdf",
+        caption=f"✅ Complemento de pago timbrado. Folio: {folio}"
+    )
+    await telegram_client.send_document(chat_id, xml_bytes, f"rep_{invoice_id[:8]}.xml")
+    sheets_client.log_to_bitacora(
+        invoice_id=invoice_id, canal_id=chat_id,
+        rfc_emisor=client_profile.rfc, rfc_receptor=rep_data.receptor.rfc,
+        monto=rep_data.monto_pagado, total=rep_data.monto_pagado,
+        requirio_revision=False, estado="timbrado", folio_fiscal=folio,
+        tipo="rep", uuid_factura_origen=rep_data.uuid_factura_origen,
+        imp_saldo_insoluto=imp_saldo_insoluto,
+    )
+    logger.info("REP timbrado: %s → folio %s", invoice_id, folio)
 
 
 # ---------------------------------------------------------------------------

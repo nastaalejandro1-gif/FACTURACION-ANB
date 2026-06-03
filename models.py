@@ -111,6 +111,37 @@ class InvoiceData(BaseModel):
     factura: FacturaData
 
 
+class RepData(BaseModel):
+    estatus: Literal["confirmado_por_cliente"]
+    uuid_factura_origen: str
+    receptor: ReceptorData
+    fecha_pago: str
+    forma_pago: str
+    monto_pagado: float = Field(gt=0)
+    requiere_revision: bool = False
+    motivo_revision: str = ""
+
+    @field_validator("forma_pago")
+    @classmethod
+    def validate_forma_pago_rep(cls, v: str) -> str:
+        validas = FORMAS_PAGO_VALIDAS - {"99"}
+        if v not in validas:
+            raise ValueError(
+                f"Forma de pago '{v}' no válida para REP. No puede ser '99'. "
+                "Use: 03=Transferencia, 04=Tarjeta, 01=Efectivo, etc."
+            )
+        return v
+
+    @field_validator("uuid_factura_origen")
+    @classmethod
+    def validate_uuid(cls, v: str) -> str:
+        import re
+        v = v.upper().strip()
+        if not re.match(r"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$", v):
+            raise ValueError(f"UUID inválido: '{v}'. Formato esperado: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX")
+        return v
+
+
 class ClientProfile(BaseModel):
     despacho_id: str
     id_cliente: str

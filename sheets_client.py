@@ -270,6 +270,20 @@ def is_message_already_processed(telegram_message_id: int) -> bool:
 # Bitácora
 # ---------------------------------------------------------------------------
 
+def get_rep_history(uuid_factura_origen: str) -> list[dict]:
+    """Retorna todos los REPs registrados para un UUID de factura origen, ordenados por timestamp."""
+    sb = _get_supabase()
+    result = (
+        sb.table("bitacora")
+        .select("*")
+        .eq("uuid_factura_origen", uuid_factura_origen.upper())
+        .eq("tipo", "rep")
+        .order("timestamp")
+        .execute()
+    )
+    return result.data or []
+
+
 def log_to_bitacora(
     invoice_id: str,
     canal_id: str,
@@ -281,23 +295,29 @@ def log_to_bitacora(
     estado: str,
     folio_fiscal: str = "",
     error_detalle: str = "",
+    tipo: str = "ingreso",
+    uuid_factura_origen: str = "",
+    imp_saldo_insoluto: Optional[float] = None,
 ) -> None:
     sb = _get_supabase()
     now = datetime.now(timezone.utc).isoformat()
-    sb.table("bitacora").upsert(
-        {
-            "id": invoice_id,
-            "despacho_id": DESPACHO_ID,
-            "canal_id": str(int(float(canal_id))),
-            "rfc_emisor": rfc_emisor,
-            "rfc_receptor": rfc_receptor,
-            "monto": monto,
-            "total": total,
-            "requirio_revision": requirio_revision,
-            "estado": estado,
-            "folio_fiscal": folio_fiscal,
-            "timestamp": now,
-            "error_detalle": error_detalle,
-        },
-        on_conflict="id",
-    ).execute()
+    row = {
+        "id": invoice_id,
+        "despacho_id": DESPACHO_ID,
+        "canal_id": str(int(float(canal_id))),
+        "rfc_emisor": rfc_emisor,
+        "rfc_receptor": rfc_receptor,
+        "monto": monto,
+        "total": total,
+        "requirio_revision": requirio_revision,
+        "estado": estado,
+        "folio_fiscal": folio_fiscal,
+        "timestamp": now,
+        "error_detalle": error_detalle,
+        "tipo": tipo,
+    }
+    if uuid_factura_origen:
+        row["uuid_factura_origen"] = uuid_factura_origen.upper()
+    if imp_saldo_insoluto is not None:
+        row["imp_saldo_insoluto"] = imp_saldo_insoluto
+    sb.table("bitacora").upsert(row, on_conflict="id").execute()

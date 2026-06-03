@@ -4,6 +4,8 @@ FORMAS_PAGO_ENUM = [
     "27", "28", "29", "30", "31", "99",
 ]
 
+FORMAS_PAGO_ENUM_REP = [f for f in FORMAS_PAGO_ENUM if f != "99"]
+
 CLAUDE_TOOLS = [
     {
         "name": "generate_invoice_data",
@@ -88,5 +90,54 @@ CLAUDE_TOOLS = [
             },
             "required": ["estatus", "requiere_revision", "emisor", "receptor", "factura"],
         },
-    }
+    },
+    {
+        "name": "generate_rep_data",
+        "description": (
+            "Genera los datos del Recibo Electrónico de Pago (complemento de pago / REP) "
+            "ÚNICAMENTE cuando el cliente ha confirmado explícitamente todos los datos del pago. "
+            "Usar solo cuando el cliente reporta el pago de una factura PPD existente, "
+            "NO para facturas nuevas."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "estatus": {"type": "string", "enum": ["confirmado_por_cliente"]},
+                "uuid_factura_origen": {
+                    "type": "string",
+                    "description": "UUID / Folio Fiscal del CFDI PPD original. Formato: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
+                },
+                "receptor": {
+                    "type": "object",
+                    "properties": {
+                        "razon_social": {"type": "string"},
+                        "rfc": {"type": "string"},
+                        "regimen_fiscal": {"type": "string"},
+                        "cp_fiscal": {"type": "string"},
+                        "uso_cfdi": {"type": "string"},
+                    },
+                    "required": ["razon_social", "rfc", "regimen_fiscal", "cp_fiscal", "uso_cfdi"],
+                },
+                "fecha_pago": {
+                    "type": "string",
+                    "description": "Fecha y hora del pago ISO 8601: YYYY-MM-DDTHH:MM:SS. Sin hora: usa T12:00:00.",
+                },
+                "forma_pago": {
+                    "type": "string",
+                    "enum": FORMAS_PAGO_ENUM_REP,
+                    "description": "Forma de pago real (no puede ser 99). 03=Transferencia, 04=Tarjeta crédito, 28=Tarjeta débito, 01=Efectivo.",
+                },
+                "monto_pagado": {
+                    "type": "number",
+                    "description": "Monto pagado en esta transacción.",
+                },
+                "requiere_revision": {"type": "boolean"},
+                "motivo_revision": {"type": "string", "default": ""},
+            },
+            "required": [
+                "estatus", "uuid_factura_origen", "receptor",
+                "fecha_pago", "forma_pago", "monto_pagado", "requiere_revision",
+            ],
+        },
+    },
 ]
