@@ -56,33 +56,44 @@ async def process_update(update: dict) -> None:
     chat_id = str(message["chat"]["id"])
     message_id = int(message.get("message_id", 0))
 
-    # Idempotency — skip if already processed
-    if sheets_client.is_message_already_processed(message_id):
-        logger.info("Mensaje %d ya procesado, ignorando", message_id)
-        return
+    try:
+        # Idempotency — skip if already processed
+        if sheets_client.is_message_already_processed(message_id):
+            logger.info("Mensaje %d ya procesado, ignorando", message_id)
+            return
 
-    # Route commands
-    text = message.get("text", "")
-    if text.startswith("/aprobar") or text.startswith("/rechazar"):
-        await handle_approval_command(chat_id, message_id, text)
-        return
+        # Route commands
+        text = message.get("text", "")
+        if text.startswith("/aprobar") or text.startswith("/rechazar"):
+            await handle_approval_command(chat_id, message_id, text)
+            return
 
-    # Identify client
-    client_profile = sheets_client.get_client_by_canal_id("telegram", chat_id)
-    if client_profile is None:
-        await telegram_client.send_message(
-            chat_id,
-            "No encontré tu perfil en el sistema. Contacta a ANB Consultores para activar tu acceso."
-        )
-        await telegram_client.send_message(
-            ALEJANDRO_CHAT_ID,
-            f"⚠️ Mensaje de canal_id desconocido: {chat_id}\nMensaje: {text[:200]}"
-        )
-        return
+        # Identify client
+        client_profile = sheets_client.get_client_by_canal_id("telegram", chat_id)
+        if client_profile is None:
+            await telegram_client.send_message(
+                chat_id,
+                "No encontré tu perfil en el sistema. Contacta a ANB Consultores para activar tu acceso."
+            )
+            await telegram_client.send_message(
+                ALEJANDRO_CHAT_ID,
+                f"⚠️ Mensaje de canal_id desconocido: {chat_id}\nMensaje: {text[:200]}"
+            )
+            return
 
-    # Acquire per-channel lock (prevents concurrent history corruption)
-    async with sheets_client.get_channel_lock(chat_id):
-        await handle_conversation(client_profile, chat_id, message_id, message)
+        # Acquire per-channel lock (prevents concurrent history corruption)
+        async with sheets_client.get_channel_lock(chat_id):
+            await handle_conversation(client_profile, chat_id, message_id, message)
+
+    except Exception as exc:
+        logger.exception("Error no capturado en process_update para chat_id %s", chat_id)
+        try:
+            await telegram_client.send_message(
+                ALEJANDRO_CHAT_ID,
+                f"🔴 Error crítico en process_update\nchat_id: {chat_id}\n{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            pass
 
 
 async def handle_conversation(client_profile, chat_id: str, message_id: int, message: dict) -> None:
