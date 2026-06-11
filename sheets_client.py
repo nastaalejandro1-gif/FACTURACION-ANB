@@ -271,13 +271,17 @@ def is_message_already_processed(telegram_message_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def get_rep_history(uuid_factura_origen: str) -> list[dict]:
-    """Retorna todos los REPs registrados para un UUID de factura origen, ordenados por timestamp."""
+    """Retorna los REPs timbrados para un UUID de factura origen, ordenados por timestamp.
+
+    Solo cuenta estado='timbrado': los intentos fallidos no consumen parcialidad
+    ni alteran el saldo insoluto."""
     sb = _get_supabase()
     result = (
         sb.table("bitacora")
         .select("*")
         .eq("uuid_factura_origen", uuid_factura_origen.upper())
         .eq("tipo", "rep")
+        .eq("estado", "timbrado")
         .order("timestamp")
         .execute()
     )

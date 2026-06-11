@@ -32,8 +32,15 @@ VALID_INVOICE = {
         "uso_cfdi": "G03",
     },
     "factura": {
-        "concepto": "Servicios de contabilidad",
-        "clave_prod_serv": "78101803",
+        "conceptos": [
+            {
+                "descripcion": "Servicios de contabilidad",
+                "clave_prod_serv": "78101803",
+                "cantidad": 1,
+                "clave_unidad": "E48",
+                "precio_unitario": 5000.0,
+            },
+        ],
         "monto_antes_impuestos": 5000.0,
         "iva": 800.0,
         "retencion_iva": 85.36,
@@ -254,6 +261,37 @@ def test_rfc_lowercase_normalized():
         uso_cfdi="G03",
     )
     assert r.rfc == "EMP010101AA1"
+
+
+# ---------------------------------------------------------------------------
+# TC-14: Ruteo de pendientes — un REP se distingue por uuid_factura_origen
+# ---------------------------------------------------------------------------
+
+VALID_REP = {
+    "estatus": "confirmado_por_cliente",
+    "uuid_factura_origen": "12345678-ABCD-1234-ABCD-123456789012",
+    "receptor": VALID_INVOICE["receptor"],
+    "fecha_pago": "2026-06-01T12:00:00",
+    "forma_pago": "03",
+    "monto_pagado": 5652.14,
+    "requiere_revision": False,
+    "motivo_revision": "",
+}
+
+
+def test_pending_rep_detected_by_uuid_field():
+    from models import RepData
+    # La regla de main.handle_approval_command: presencia de uuid_factura_origen → REP
+    assert "uuid_factura_origen" in VALID_REP
+    assert "uuid_factura_origen" not in VALID_INVOICE
+    data = RepData(**VALID_REP)
+    assert data.monto_pagado == 5652.14
+
+
+def test_pending_invoice_payload_not_valid_rep():
+    from models import RepData
+    with pytest.raises(ValidationError):
+        RepData(**VALID_INVOICE)
 
 
 def test_rfc_with_spaces_rejected():

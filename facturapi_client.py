@@ -105,12 +105,12 @@ def _build_taxes(data: InvoiceData) -> list:
 async def create_invoice(invoice_data: InvoiceData, facturapi_key: str) -> dict:
     """
     Llama a FacturAPI para timbrar el CFDI.
-    facturapi_key: API key de la organización del cliente (viene de Sheets).
+    facturapi_key: API key de la organización del cliente (viene de Supabase).
     Returns: {"id": "...", "folio_fiscal": "...", "pdf_url": "...", "xml_url": "..."}
     Raises: httpx.HTTPStatusError on 4xx (no retry), httpx.TimeoutException on timeout.
     """
     if not facturapi_key:
-        raise ValueError("El cliente no tiene configurada una API key de FacturAPI en Google Sheets.")
+        raise ValueError("El cliente no tiene configurada una API key de FacturAPI en Supabase (tabla clientes).")
 
     payload = _build_facturapi_payload(invoice_data)
     logger.info("FacturAPI payload: %s", payload)

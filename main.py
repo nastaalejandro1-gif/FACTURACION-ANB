@@ -455,29 +455,53 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"No encontré la factura con ID: {invoice_id}")
         return
 
+    # Idempotencia: un /aprobar repetido sobre algo ya procesado timbraría un CFDI duplicado
+    estado_actual = str(pending.get("estado", ""))
+    if estado_actual != "pendiente":
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"La solicitud {invoice_id} ya fue procesada (estado: {estado_actual}). No se timbró de nuevo."
+        )
+        return
+
     client_canal_id = str(pending["canal_id"])
+
+    try:
+        payload = json.loads(pending["invoice_json"])
+    except Exception as exc:
+        logger.exception("Error leyendo invoice_json para %s", invoice_id)
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"Error al leer datos de la solicitud: {exc}")
+        return
+
+    # Los REPs en pendientes se distinguen por uuid_factura_origen (campo obligatorio de RepData)
+    es_rep = "uuid_factura_origen" in payload
 
     if command == "/rechazar":
         sheets_client.update_pending_status(pending["id"], "rechazado")
         await telegram_client.send_message(
             client_canal_id,
-            "Tu solicitud de factura no pudo procesarse. El despacho te contactará para más información."
+            "Tu solicitud no pudo procesarse. El despacho te contactará para más información."
         )
-        await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"✅ Factura {invoice_id} rechazada.")
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"✅ {'REP' if es_rep else 'Factura'} {invoice_id} rechazado."
+        )
         sheets_client.log_to_bitacora(
             invoice_id=invoice_id, canal_id=client_canal_id,
             rfc_emisor="", rfc_receptor="",
             monto=0, total=0,
             requirio_revision=True, estado="rechazado",
+            tipo="rep" if es_rep else "ingreso",
+            uuid_factura_origen=payload.get("uuid_factura_origen", "") if es_rep else "",
         )
         return
 
-    # /aprobar — reconstruct InvoiceData and timbre
+    # /aprobar — reconstruct data model and timbre
     try:
-        invoice_data = InvoiceData(**json.loads(pending["invoice_json"]))
+        data = RepData(**payload) if es_rep else InvoiceData(**payload)
     except Exception as exc:
-        logger.exception("Error reconstruyendo InvoiceData para %s", invoice_id)
-        await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"Error al leer datos de la factura: {exc}")
+        logger.exception("Error reconstruyendo datos para %s", invoice_id)
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"Error al leer datos de la solicitud: {exc}")
         return
 
     # Retrieve the client profile to get their FacturAPI key
@@ -492,8 +516,12 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
         return
 
     sheets_client.update_pending_status(pending["id"], "aprobado")
-    await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⏳ Timbrando factura {invoice_id}...")
-    await _timbre_and_deliver(invoice_id, invoice_data, client_profile, client_canal_id, 0)
+    if es_rep:
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⏳ Timbrando REP {invoice_id}...")
+        await _timbre_and_deliver_rep(invoice_id, data, client_profile, client_canal_id, client_profile.facturapi_key)
+    else:
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⏳ Timbrando factura {invoice_id}...")
+        await _timbre_and_deliver(invoice_id, data, client_profile, client_canal_id, 0)
 
 
 # ---------------------------------------------------------------------------
