@@ -28,6 +28,21 @@ _facturapi_retry = retry(
 )
 
 
+def _is_retryable_write(exc: BaseException) -> bool:
+    # Para timbres (POST) solo reintentar si la petición NUNCA llegó al servidor.
+    # Un ReadTimeout o un 5xx puede significar que FacturAPI YA timbró la factura:
+    # reintentar a ciegas crearía un CFDI duplicado ante el SAT.
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+
+
+_facturapi_retry_write = retry(
+    retry=retry_if_exception(_is_retryable_write),
+    wait=wait_exponential(multiplier=1, min=2, max=20),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
+
+
 def _build_facturapi_payload(data: InvoiceData) -> dict:
     taxes = _build_taxes(data)
 
@@ -101,7 +116,7 @@ def _build_taxes(data: InvoiceData) -> list:
     return taxes
 
 
-@_facturapi_retry
+@_facturapi_retry_write
 async def create_invoice(invoice_data: InvoiceData, facturapi_key: str) -> dict:
     """
     Llama a FacturAPI para timbrar el CFDI.
@@ -135,6 +150,7 @@ async def create_invoice(invoice_data: InvoiceData, facturapi_key: str) -> dict:
     return response.json()
 
 
+@_facturapi_retry
 async def download_pdf(invoice_id: str, facturapi_key: str) -> bytes:
     headers = {"Authorization": f"Bearer {facturapi_key}"}
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -146,6 +162,7 @@ async def download_pdf(invoice_id: str, facturapi_key: str) -> bytes:
         return response.content
 
 
+@_facturapi_retry
 async def download_xml(invoice_id: str, facturapi_key: str) -> bytes:
     headers = {"Authorization": f"Bearer {facturapi_key}"}
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -176,7 +193,7 @@ async def search_invoice_by_uuid(uuid: str, facturapi_key: str) -> Optional[dict
         return None
 
 
-@_facturapi_retry
+@_facturapi_retry_write
 async def create_rep(
     rep_data: RepData,
     facturapi_key: str,

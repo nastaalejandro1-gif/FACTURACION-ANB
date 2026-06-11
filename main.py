@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import uuid
@@ -58,7 +59,7 @@ async def process_update(update: dict) -> None:
 
     try:
         # Idempotency — skip if already processed
-        if sheets_client.is_message_already_processed(message_id):
+        if await asyncio.to_thread(sheets_client.is_message_already_processed, chat_id, message_id):
             logger.info("Mensaje %d ya procesado, ignorando", message_id)
             return
 
@@ -69,7 +70,7 @@ async def process_update(update: dict) -> None:
             return
 
         # Identify client
-        client_profile = sheets_client.get_client_by_canal_id("telegram", chat_id)
+        client_profile = await asyncio.to_thread(sheets_client.get_client_by_canal_id, "telegram", chat_id)
         if client_profile is None:
             await telegram_client.send_message(
                 chat_id,
@@ -97,7 +98,7 @@ async def process_update(update: dict) -> None:
 
 
 async def handle_conversation(client_profile, chat_id: str, message_id: int, message: dict) -> None:
-    history = sheets_client.load_history(chat_id)
+    history = await asyncio.to_thread(sheets_client.load_history, chat_id)
 
     # Extract text and/or file
     user_text: Optional[str] = message.get("text") or message.get("caption")
@@ -125,7 +126,10 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
             await telegram_client.send_message(chat_id, "No entendí tu mensaje. ¿En qué te puedo ayudar?")
             return
 
-        client_message, invoice_data, rep_data = run_conversation_turn(
+        # En hilo aparte: la llamada a Claude tarda segundos (PDFs: hasta un minuto)
+        # y bloquearía el procesamiento de TODOS los demás clientes.
+        client_message, invoice_data, rep_data = await asyncio.to_thread(
+            run_conversation_turn,
             profile=client_profile,
             history=history,
             user_text=user_text,
@@ -155,7 +159,7 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
     finally:
         # Always save history (even on error, to preserve what we have)
         try:
-            sheets_client.save_history("telegram", chat_id, history)
+            await asyncio.to_thread(sheets_client.save_history, "telegram", chat_id, history)
         except Exception:
             logger.exception("Error guardando historial para %s", chat_id)
 
@@ -177,7 +181,8 @@ async def process_invoice(
 
     if invoice_data.requiere_revision or client_profile.requiere_revision:
         motivo = invoice_data.motivo_revision or "Perfil del cliente marcado para revisión manual"
-        sheets_client.save_pending(
+        await asyncio.to_thread(
+            sheets_client.save_pending,
             invoice_id=invoice_id,
             canal="telegram",
             canal_id=chat_id,
@@ -200,7 +205,8 @@ async def process_invoice(
             f"Total: ${invoice_data.factura.total_estimado:,.2f}\n\n"
             f"Responde:\n/aprobar {invoice_id}\n/rechazar {invoice_id}"
         )
-        sheets_client.log_to_bitacora(
+        await asyncio.to_thread(
+            sheets_client.log_to_bitacora,
             invoice_id=invoice_id,
             canal_id=chat_id,
             rfc_emisor=invoice_data.emisor.rfc,
@@ -228,28 +234,6 @@ async def _timbre_and_deliver(
     try:
         result = await create_invoice(invoice_data, facturapi_key)
         folio = result.get("id", "")
-        pdf_bytes = await download_pdf(folio, facturapi_key)
-        xml_bytes = await download_xml(folio, facturapi_key)
-    except httpx.TimeoutException:
-        error_msg = "timeout al conectar con FacturAPI"
-        logger.error("FacturAPI timeout para %s", invoice_id)
-        await telegram_client.send_message(
-            chat_id,
-            "Hubo un problema al generar tu factura (tiempo de espera agotado). "
-            "El despacho ha sido notificado y lo resolveremos pronto."
-        )
-        await telegram_client.send_message(
-            ALEJANDRO_CHAT_ID,
-            f"⏱️ Timeout en FacturAPI\nCliente: {client_profile.nombre_comercial}\nID: {invoice_id}"
-        )
-        sheets_client.log_to_bitacora(
-            invoice_id=invoice_id, canal_id=chat_id,
-            rfc_emisor=invoice_data.emisor.rfc, rfc_receptor=invoice_data.receptor.rfc,
-            monto=invoice_data.factura.monto_antes_impuestos,
-            total=invoice_data.factura.total_estimado,
-            requirio_revision=False, estado="error", error_detalle=error_msg,
-        )
-        return
     except httpx.HTTPStatusError as exc:
         error_msg = str(exc)[:500]
         logger.error("FacturAPI error HTTP para %s: %s", invoice_id, error_msg)
@@ -262,12 +246,65 @@ async def _timbre_and_deliver(
             ALEJANDRO_CHAT_ID,
             f"❌ Error FacturAPI\nCliente: {client_profile.nombre_comercial}\nID: {invoice_id}\n{error_msg}"
         )
-        sheets_client.log_to_bitacora(
+        await asyncio.to_thread(
+            sheets_client.log_to_bitacora,
             invoice_id=invoice_id, canal_id=chat_id,
             rfc_emisor=invoice_data.emisor.rfc, rfc_receptor=invoice_data.receptor.rfc,
             monto=invoice_data.factura.monto_antes_impuestos,
             total=invoice_data.factura.total_estimado,
             requirio_revision=False, estado="error", error_detalle=error_msg,
+        )
+        return
+    except httpx.RequestError as exc:
+        # Timeout o error de conexión/DNS: la factura PUDO haberse timbrado en
+        # FacturAPI aunque no recibimos respuesta. No reintentar a ciegas.
+        error_msg = f"{type(exc).__name__}: {exc}"[:500]
+        logger.error("FacturAPI error de red para %s: %s", invoice_id, error_msg)
+        await telegram_client.send_message(
+            chat_id,
+            "Hubo un problema de conexión al generar tu factura. "
+            "El despacho ha sido notificado y lo resolveremos pronto."
+        )
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"⏱️ Error de red con FacturAPI\nCliente: {client_profile.nombre_comercial}\nID: {invoice_id}\n{error_msg}\n\n"
+            f"⚠️ Verifica en FacturAPI si la factura se timbró ANTES de reintentar."
+        )
+        await asyncio.to_thread(
+            sheets_client.log_to_bitacora,
+            invoice_id=invoice_id, canal_id=chat_id,
+            rfc_emisor=invoice_data.emisor.rfc, rfc_receptor=invoice_data.receptor.rfc,
+            monto=invoice_data.factura.monto_antes_impuestos,
+            total=invoice_data.factura.total_estimado,
+            requirio_revision=False, estado="error", error_detalle=error_msg,
+        )
+        return
+
+    # A partir de aquí la factura YA está timbrada: un fallo en la descarga o
+    # entrega NO debe registrarse como error (el cliente reintentaría y duplicaría).
+    try:
+        pdf_bytes = await download_pdf(folio, facturapi_key)
+        xml_bytes = await download_xml(folio, facturapi_key)
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        logger.error("Factura %s timbrada (folio %s) pero falló la descarga: %s", invoice_id, folio, exc)
+        await telegram_client.send_message(
+            chat_id,
+            f"✅ Tu factura fue timbrada (folio: {folio}), pero hubo un problema al "
+            "enviarte los archivos. El despacho te los hará llegar."
+        )
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"⚠️ Factura {invoice_id} timbrada (folio {folio}) pero falló la descarga del PDF/XML. "
+            f"Descárgalos de FacturAPI y envíalos al cliente.\n{type(exc).__name__}: {exc}"
+        )
+        await asyncio.to_thread(
+            sheets_client.log_to_bitacora,
+            invoice_id=invoice_id, canal_id=chat_id,
+            rfc_emisor=invoice_data.emisor.rfc, rfc_receptor=invoice_data.receptor.rfc,
+            monto=invoice_data.factura.monto_antes_impuestos,
+            total=invoice_data.factura.total_estimado,
+            requirio_revision=False, estado="timbrado", folio_fiscal=folio,
+            error_detalle="timbrada OK; falló descarga/entrega de PDF y XML",
         )
         return
 
@@ -286,7 +323,8 @@ async def _timbre_and_deliver(
         pdf_bytes=pdf_bytes,
         xml_bytes=xml_bytes,
     )
-    sheets_client.log_to_bitacora(
+    await asyncio.to_thread(
+        sheets_client.log_to_bitacora,
         invoice_id=invoice_id, canal_id=chat_id,
         rfc_emisor=invoice_data.emisor.rfc, rfc_receptor=invoice_data.receptor.rfc,
         monto=invoice_data.factura.monto_antes_impuestos,
@@ -311,7 +349,8 @@ async def process_rep(
 
     if rep_data.requiere_revision:
         motivo = rep_data.motivo_revision or "REP requiere revisión manual"
-        sheets_client.save_pending(
+        await asyncio.to_thread(
+            sheets_client.save_pending,
             invoice_id=invoice_id,
             canal="telegram",
             canal_id=chat_id,
@@ -346,7 +385,21 @@ async def _timbre_and_deliver_rep(
     facturapi_key: str,
 ) -> None:
     # Look up original invoice in FacturAPI to get total and calculate saldo
-    original_invoice = await search_invoice_by_uuid(rep_data.uuid_factura_origen, facturapi_key)
+    try:
+        original_invoice = await search_invoice_by_uuid(rep_data.uuid_factura_origen, facturapi_key)
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        logger.error("Error buscando factura origen %s: %s", rep_data.uuid_factura_origen, exc)
+        await telegram_client.send_message(
+            chat_id,
+            "Hubo un problema de conexión al buscar tu factura original. "
+            "El despacho ha sido notificado; vuelve a intentarlo en unos minutos."
+        )
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"⏱️ Error de red buscando UUID {rep_data.uuid_factura_origen} para REP\n"
+            f"Cliente: {client_profile.nombre_comercial}\n{type(exc).__name__}: {exc}"
+        )
+        return
     if not original_invoice:
         await telegram_client.send_message(
             chat_id,
@@ -362,7 +415,7 @@ async def _timbre_and_deliver_rep(
     invoice_total = float(original_invoice.get("total", 0))
 
     # Determine parcialidad and saldo anterior from previous REPs
-    previous_reps = sheets_client.get_rep_history(rep_data.uuid_factura_origen)
+    previous_reps = await asyncio.to_thread(sheets_client.get_rep_history, rep_data.uuid_factura_origen)
     if previous_reps:
         last_rep = previous_reps[-1]
         imp_saldo_ant = float(last_rep.get("imp_saldo_insoluto") or 0)
@@ -375,25 +428,6 @@ async def _timbre_and_deliver_rep(
         result = await create_rep(rep_data, facturapi_key, num_parcialidad, imp_saldo_ant)
         folio = result.get("id", "")
         imp_saldo_insoluto = result.get("_imp_saldo_insoluto", 0.0)
-        pdf_bytes = await download_pdf(folio, facturapi_key)
-        xml_bytes = await download_xml(folio, facturapi_key)
-    except httpx.TimeoutException:
-        await telegram_client.send_message(
-            chat_id,
-            "Tiempo de espera agotado al generar el complemento. El despacho ha sido notificado."
-        )
-        await telegram_client.send_message(
-            ALEJANDRO_CHAT_ID,
-            f"⏱️ Timeout en REP\nCliente: {client_profile.nombre_comercial}\nID: {invoice_id}"
-        )
-        sheets_client.log_to_bitacora(
-            invoice_id=invoice_id, canal_id=chat_id,
-            rfc_emisor=client_profile.rfc, rfc_receptor=rep_data.receptor.rfc,
-            monto=rep_data.monto_pagado, total=rep_data.monto_pagado,
-            requirio_revision=False, estado="error", error_detalle="timeout",
-            tipo="rep", uuid_factura_origen=rep_data.uuid_factura_origen,
-        )
-        return
     except httpx.HTTPStatusError as exc:
         error_msg = str(exc)[:500]
         await telegram_client.send_message(
@@ -404,7 +438,29 @@ async def _timbre_and_deliver_rep(
             ALEJANDRO_CHAT_ID,
             f"❌ Error REP FacturAPI\nCliente: {client_profile.nombre_comercial}\n{error_msg}"
         )
-        sheets_client.log_to_bitacora(
+        await asyncio.to_thread(
+            sheets_client.log_to_bitacora,
+            invoice_id=invoice_id, canal_id=chat_id,
+            rfc_emisor=client_profile.rfc, rfc_receptor=rep_data.receptor.rfc,
+            monto=rep_data.monto_pagado, total=rep_data.monto_pagado,
+            requirio_revision=False, estado="error", error_detalle=error_msg,
+            tipo="rep", uuid_factura_origen=rep_data.uuid_factura_origen,
+        )
+        return
+    except httpx.RequestError as exc:
+        # Timeout o error de conexión: el REP pudo haberse timbrado. No reintentar a ciegas.
+        error_msg = f"{type(exc).__name__}: {exc}"[:500]
+        await telegram_client.send_message(
+            chat_id,
+            "Hubo un problema de conexión al generar el complemento. El despacho ha sido notificado."
+        )
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"⏱️ Error de red en REP\nCliente: {client_profile.nombre_comercial}\nID: {invoice_id}\n{error_msg}\n\n"
+            f"⚠️ Verifica en FacturAPI si el REP se timbró ANTES de reintentar."
+        )
+        await asyncio.to_thread(
+            sheets_client.log_to_bitacora,
             invoice_id=invoice_id, canal_id=chat_id,
             rfc_emisor=client_profile.rfc, rfc_receptor=rep_data.receptor.rfc,
             monto=rep_data.monto_pagado, total=rep_data.monto_pagado,
@@ -413,12 +469,42 @@ async def _timbre_and_deliver_rep(
         )
         return
 
+    # REP ya timbrado: registrar SIEMPRE en bitácora aunque falle la entrega,
+    # porque la siguiente parcialidad depende de este imp_saldo_insoluto.
+    try:
+        pdf_bytes = await download_pdf(folio, facturapi_key)
+        xml_bytes = await download_xml(folio, facturapi_key)
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        logger.error("REP %s timbrado (folio %s) pero falló la descarga: %s", invoice_id, folio, exc)
+        await telegram_client.send_message(
+            chat_id,
+            f"✅ Tu complemento de pago fue timbrado (folio: {folio}), pero hubo un problema "
+            "al enviarte los archivos. El despacho te los hará llegar."
+        )
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"⚠️ REP {invoice_id} timbrado (folio {folio}) pero falló la descarga del PDF/XML. "
+            f"Descárgalos de FacturAPI y envíalos al cliente.\n{type(exc).__name__}: {exc}"
+        )
+        await asyncio.to_thread(
+            sheets_client.log_to_bitacora,
+            invoice_id=invoice_id, canal_id=chat_id,
+            rfc_emisor=client_profile.rfc, rfc_receptor=rep_data.receptor.rfc,
+            monto=rep_data.monto_pagado, total=rep_data.monto_pagado,
+            requirio_revision=False, estado="timbrado", folio_fiscal=folio,
+            error_detalle="timbrado OK; falló descarga/entrega de PDF y XML",
+            tipo="rep", uuid_factura_origen=rep_data.uuid_factura_origen,
+            imp_saldo_insoluto=imp_saldo_insoluto,
+        )
+        return
+
     await telegram_client.send_document(
         chat_id, pdf_bytes, f"rep_{invoice_id[:8]}.pdf",
         caption=f"✅ Complemento de pago timbrado. Folio: {folio}"
     )
     await telegram_client.send_document(chat_id, xml_bytes, f"rep_{invoice_id[:8]}.xml")
-    sheets_client.log_to_bitacora(
+    await asyncio.to_thread(
+        sheets_client.log_to_bitacora,
         invoice_id=invoice_id, canal_id=chat_id,
         rfc_emisor=client_profile.rfc, rfc_receptor=rep_data.receptor.rfc,
         monto=rep_data.monto_pagado, total=rep_data.monto_pagado,
@@ -450,7 +536,7 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
     command = parts[0].lower()
     invoice_id = parts[1]
 
-    pending = sheets_client.get_pending(invoice_id)
+    pending = await asyncio.to_thread(sheets_client.get_pending, invoice_id)
     if not pending:
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"No encontré la factura con ID: {invoice_id}")
         return
@@ -477,7 +563,7 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
     es_rep = "uuid_factura_origen" in payload
 
     if command == "/rechazar":
-        sheets_client.update_pending_status(pending["id"], "rechazado")
+        await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "rechazado")
         await telegram_client.send_message(
             client_canal_id,
             "Tu solicitud no pudo procesarse. El despacho te contactará para más información."
@@ -486,7 +572,8 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
             ALEJANDRO_CHAT_ID,
             f"✅ {'REP' if es_rep else 'Factura'} {invoice_id} rechazado."
         )
-        sheets_client.log_to_bitacora(
+        await asyncio.to_thread(
+            sheets_client.log_to_bitacora,
             invoice_id=invoice_id, canal_id=client_canal_id,
             rfc_emisor="", rfc_receptor="",
             monto=0, total=0,
@@ -506,7 +593,7 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
 
     # Retrieve the client profile to get their FacturAPI key
     canal = str(pending.get("canal", "telegram"))
-    client_profile = sheets_client.get_client_by_canal_id(canal, client_canal_id)
+    client_profile = await asyncio.to_thread(sheets_client.get_client_by_canal_id, canal, client_canal_id)
     if not client_profile:
         await telegram_client.send_message(
             ALEJANDRO_CHAT_ID,
@@ -515,7 +602,7 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
         )
         return
 
-    sheets_client.update_pending_status(pending["id"], "aprobado")
+    await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "aprobado")
     if es_rep:
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⏳ Timbrando REP {invoice_id}...")
         await _timbre_and_deliver_rep(invoice_id, data, client_profile, client_canal_id, client_profile.facturapi_key)
@@ -533,7 +620,7 @@ async def check_pending(x_cron_secret: Optional[str] = Header(None)):
     if x_cron_secret != CRON_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    overdue = sheets_client.get_overdue_pending(hours=24)
+    overdue = await asyncio.to_thread(sheets_client.get_overdue_pending, 24)
     if not overdue:
         return {"checked": 0}
 

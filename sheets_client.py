@@ -255,11 +255,14 @@ def get_overdue_pending(hours: int = 24) -> list[dict]:
     return result.data or []
 
 
-def is_message_already_processed(telegram_message_id: int) -> bool:
+def is_message_already_processed(canal_id: str, telegram_message_id: int) -> bool:
+    # message_id en Telegram es un contador POR CHAT, no global: dos clientes
+    # distintos comparten los mismos números. Filtrar siempre junto con canal_id.
     sb = _get_supabase()
     result = (
         sb.table("pendientes")
         .select("id")
+        .eq("canal_id", str(canal_id))
         .eq("telegram_message_id", telegram_message_id)
         .execute()
     )
