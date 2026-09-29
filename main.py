@@ -111,6 +111,21 @@ async def process_update(update: dict) -> None:
             )
             return
 
+        # /start — reinicio explícito del historial. Los clientes ya lo
+        # usaban intuitivamente ("/start", "empieza de nuevo") esperando
+        # borrón y cuenta nueva, pero antes no hacía nada especial: el
+        # historial seguía creciendo indefinidamente y cada factura nueva
+        # pagaba por reenviar TODAS las conversaciones previas ya
+        # completadas (medido: ~$0.22 extra por factura en un caso real
+        # con 80 mensajes acumulados) — además de arriesgar que Claude se
+        # distraiga con contexto de pedidos viejos ya resueltos.
+        if text.strip() == "/start":
+            await asyncio.to_thread(sheets_client.save_history, "telegram", chat_id, [])
+            await telegram_client.send_message(
+                chat_id, f"¡Listo! Empezamos de cero. 😊 Bienvenido a **{client_profile.nombre_comercial}** con ANB Consultores."
+            )
+            return
+
         # Acquire per-channel lock (prevents concurrent history corruption)
         async with sheets_client.get_channel_lock(chat_id):
             await handle_conversation(client_profile, chat_id, message_id, message)

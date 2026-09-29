@@ -331,15 +331,18 @@ def run_conversation_turn(
                     }],
                 })
 
-                # Strip binary del historial ya guardado — reduce el costo del
-                # PRÓXIMO turno de este cliente.
-                for i, msg in enumerate(history):
-                    if isinstance(msg.get("content"), list):
-                        history[i]["content"] = [
-                            b if not (isinstance(b, dict) and b.get("type") in ("image", "document"))
-                            else {"type": "text", "text": "[documento adjunto — datos extraídos]"}
-                            for b in msg["content"]
-                        ]
+                # Reiniciar el historial: la extracción para ESTE pedido ya
+                # terminó (el draft se le entrega a fiscal_engine fuera de
+                # esta capa; la confirmación final es por botones, no pasa
+                # por Claude). Medido contra una conversación real de
+                # producción: sin este reinicio, cada factura nueva del
+                # mismo cliente paga por reenviar TODAS las facturas/REPs
+                # previos ya completados en el mismo hilo de Telegram como
+                # contexto (~$0.22 extra por factura en un caso real de 80
+                # mensajes acumulados) — y peor, Claude puede confundirse
+                # con contexto de pedidos viejos ya resueltos y no disparar
+                # la herramienta cuando debería.
+                history.clear()
 
                 _log_uso_claude(f"{paso_base}→{tool_name}", response)
                 if isinstance(result_data, InvoiceDraft):
