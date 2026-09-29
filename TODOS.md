@@ -68,7 +68,10 @@ clasifica, el código calcula (Decimal, tolerancia cero). Migrado a producción 
 - [ ] Deduplicar updates de Telegram por update_id (hoy un update reentregado puede duplicar una factura de auto-timbre)
 - [x] REP con sobrepago → escala (VALIDACION_ARITMETICA) en vez de recortar el saldo a 0 — hecho en Fase 4
 - [ ] Cron /check-pending: marcar notificado o mandar un solo resumen (hoy re-notifica todo en cada corrida)
-- [ ] Claude tool use paralelo: responder todos los tool_use o usar disable_parallel_tool_use
+- [x] Claude tool use paralelo — corregido: disable_parallel_tool_use en la llamada principal +
+      tool_choice="none" en la llamada de confirmación (esa NUNCA debía poder llamar una tool).
+      Encontrado probando en vivo un mensaje con REP + factura nueva mezclados — sin el fix,
+      la conversación quedaba rota para siempre para ese cliente.
 - [ ] Índices en Supabase (correr en SQL Editor):
       clientes(canal, canal_id), pendientes(canal_id, telegram_message_id),
       pendientes(estado, timestamp), bitacora(uuid_factura_origen, tipo, estado)
