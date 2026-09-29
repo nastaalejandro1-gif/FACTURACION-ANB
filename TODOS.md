@@ -42,10 +42,27 @@ clasifica, el código calcula (Decimal, tolerancia cero). Migrado a producción 
       FacturAPI, que las recalculaba contra una base distinta y devolvía un monto ~6x más
       grande (125.05 en vez de 20.01). Corregido — ver commit "fix: retenciones en FacturAPI
       back-calculadas". Sin este timbrado real nunca se hubiera detectado con tests unitarios.
-- [ ] **Probar REP contra el sandbox real** — el flujo de facturas de ingreso ya se validó
-      en vivo (Claude + FacturAPI); REP solo tiene cobertura de tests unitarios/mocks todavía.
+- [x] **Probar REP contra el sandbox real** — verificado con pago total y con 2 parcialidades
+      encadenadas (saldo insoluto se reconcilia exacto entre ambas). Encontró y corrigió el
+      formato de API obsoleto de `create_rep` y la falta de columnas en `bitacora` (ver
+      commits correspondientes).
 - [x] Tasas de impuesto exactas transportadas a FacturAPI (ya no se recalculan por división) —
       excepto retenciones, que se back-calculan a propósito (ver arriba).
+- [x] **Bug de redondeo agregado vs. por concepto en IVA** (sep 2026) — con 2+ conceptos, el
+      IVA calculado una sola vez sobre (subtotal+ieps) podía diferir en 1 centavo del que
+      calcula FacturAPI (que redondea cada concepto por separado y suma). Corregido: IVA ahora
+      se calcula por concepto, igual que el IEPS. Encontrado en auditoría con caso real
+      PM+IEPS+retenciones+3 conceptos (scripts/auditoria_completa.py).
+- [x] **Mensajes con 2 pedidos a la vez rompían la conversación permanentemente** (sep 2026) —
+      Claude podía intentar resolver "REP + factura nueva" mezclados en un mensaje llamando 2
+      tools; el código solo procesaba una, dejando la otra huérfana en el historial (ya
+      guardado en Supabase) — cada mensaje siguiente del cliente fallaba. Corregido con
+      `disable_parallel_tool_use` + `tool_choice="none"` en la llamada de confirmación.
+- [x] **Webhook de Telegram sin `callback_query`** (sep 2026) — el webhook estaba registrado
+      con `allowed_updates: ["message"]` desde antes de este restructure; los botones inline
+      (tanto `/aprobar` de ANB como la confirmación del cliente) NUNCA funcionaron porque
+      Telegram nunca entregaba esos eventos. Corregido re-registrando el webhook con
+      `["message", "edited_message", "callback_query"]`.
 - [ ] **Revisar `aplica_ieps` de claves nuevas aprobadas** — hoy el botón "Aprobar" de
       ANB siempre guarda `aplica_ieps=False` por default (más seguro que sobre-cobrar);
       si una clave nueva SÍ lleva IEPS, hay que corregirlo a mano en Supabase después de
