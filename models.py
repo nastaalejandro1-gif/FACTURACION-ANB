@@ -132,6 +132,7 @@ class ConceptoItem(BaseModel):
     clave_unidad: str = "E48"
     precio_unitario: Decimal = Field(gt=0)
     ieps: Decimal = Field(ge=0, default=Decimal("0"))
+    ieps_tasa: Decimal = Field(ge=0, default=Decimal("0"))  # tasa aplicada (0 si no gravado)
 
 
 class FacturaData(BaseModel):
@@ -139,8 +140,11 @@ class FacturaData(BaseModel):
     monto_antes_impuestos: Decimal = Field(gt=0, le=Decimal(10_000_000))
     ieps: Decimal = Field(ge=0, default=Decimal("0"))
     iva: Decimal = Field(ge=0)
+    tasa_iva: Decimal = Field(ge=0, default=Decimal("0"))
     retencion_iva: Decimal = Field(ge=0)
+    retencion_iva_tasa: Decimal = Field(ge=0, default=Decimal("0"))
     retencion_isr: Decimal = Field(ge=0)
+    retencion_isr_tasa: Decimal = Field(ge=0, default=Decimal("0"))
     total_estimado: Decimal = Field(gt=0)
     metodo_pago: Literal["PUE", "PPD"]
     forma_pago: str

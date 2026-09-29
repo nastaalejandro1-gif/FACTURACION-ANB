@@ -69,6 +69,7 @@ class ConceptoCalculado:
     precio_unitario: Decimal
     importe: Decimal
     ieps: Decimal
+    ieps_tasa: Decimal  # tasa realmente aplicada a este concepto (0 si no gravado)
 
 
 @dataclass(frozen=True)
@@ -160,7 +161,8 @@ def calcular_factura(
     for c in conceptos:
         importe = _redondear(c.cantidad * c.precio_unitario)
         aplica_ieps = c.clave_prod_serv in reglas.claves_con_ieps
-        ieps_concepto = _redondear(importe * reglas.ieps_tasa) if aplica_ieps else Decimal("0.00")
+        ieps_tasa_concepto = reglas.ieps_tasa if aplica_ieps else Decimal("0")
+        ieps_concepto = _redondear(importe * ieps_tasa_concepto) if aplica_ieps else Decimal("0.00")
         conceptos_calculados.append(ConceptoCalculado(
             descripcion=c.descripcion,
             clave_prod_serv=c.clave_prod_serv,
@@ -169,6 +171,7 @@ def calcular_factura(
             precio_unitario=c.precio_unitario,
             importe=importe,
             ieps=ieps_concepto,
+            ieps_tasa=ieps_tasa_concepto,
         ))
 
     subtotal = sum((cc.importe for cc in conceptos_calculados), Decimal("0.00"))

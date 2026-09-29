@@ -44,13 +44,18 @@ _facturapi_retry_write = retry(
 
 
 def _build_facturapi_payload(data: InvoiceData) -> dict:
+    """
+    Frontera Decimal -> float/JSON: fiscal_engine y models.py trabajan en
+    Decimal para precisión exacta; FacturAPI recibe JSON estándar (httpx no
+    sabe serializar Decimal). La conversión a float ocurre SOLO aquí.
+    """
     items = [
         {
-            "quantity": concepto.cantidad,
+            "quantity": float(concepto.cantidad),
             "product": {
                 "description": concepto.descripcion,
                 "product_key": concepto.clave_prod_serv,
-                "price": concepto.precio_unitario,
+                "price": float(concepto.precio_unitario),
                 "tax_included": False,
                 "unit_key": concepto.clave_unidad,
                 "taxes": _build_taxes_for_concepto(concepto, data),
@@ -77,13 +82,16 @@ def _build_facturapi_payload(data: InvoiceData) -> dict:
 
 
 def _build_taxes_for_concepto(concepto, data: InvoiceData) -> list:
+    # Tasas EXACTAS transportadas desde fiscal_engine/reglas_fiscales_cliente
+    # (concepto.ieps_tasa, data.factura.tasa_iva/retencion_*_tasa) — nunca
+    # recalculadas dividiendo un monto ya redondeado entre su base, que
+    # arrastra error de redondeo.
     taxes = []
-    subtotal_concepto = concepto.cantidad * concepto.precio_unitario
 
     if concepto.ieps > 0:
         taxes.append({
             "type": "IEPS",
-            "rate": round(concepto.ieps / subtotal_concepto, 6),
+            "rate": float(concepto.ieps_tasa),
             "factor": "Tasa",
             "withholding": False,
         })
@@ -91,7 +99,7 @@ def _build_taxes_for_concepto(concepto, data: InvoiceData) -> list:
     if data.factura.iva > 0:
         taxes.append({
             "type": "IVA",
-            "rate": 0.16,
+            "rate": float(data.factura.tasa_iva),
             "factor": "Tasa",
             "withholding": False,
         })
@@ -99,7 +107,7 @@ def _build_taxes_for_concepto(concepto, data: InvoiceData) -> list:
     if data.factura.retencion_iva > 0:
         taxes.append({
             "type": "IVA",
-            "rate": round(data.factura.retencion_iva / data.factura.monto_antes_impuestos, 6),
+            "rate": float(data.factura.retencion_iva_tasa),
             "factor": "Tasa",
             "withholding": True,
         })
@@ -107,7 +115,7 @@ def _build_taxes_for_concepto(concepto, data: InvoiceData) -> list:
     if data.factura.retencion_isr > 0:
         taxes.append({
             "type": "ISR",
-            "rate": round(data.factura.retencion_isr / data.factura.monto_antes_impuestos, 6),
+            "rate": float(data.factura.retencion_isr_tasa),
             "factor": "Tasa",
             "withholding": True,
         })
@@ -197,18 +205,16 @@ async def create_rep(
     rep_data: RepData,
     facturapi_key: str,
     num_parcialidad: int,
-    imp_saldo_ant: float,
 ) -> dict:
     """
     Crea un Complemento de Pago (REP) en FacturAPI.
-    imp_saldo_ant: saldo antes de este pago (total original si es primer pago).
+
+    rep_data ya trae imp_saldo_ant/imp_saldo_insoluto calculados por
+    fiscal_engine.calcular_rep con Decimal — no se recalculan aquí, solo
+    se convierten a float en la frontera JSON con FacturAPI.
     """
     if not facturapi_key:
         raise ValueError("El cliente no tiene configurada una API key de FacturAPI.")
-
-    imp_saldo_insoluto = round(imp_saldo_ant - rep_data.monto_pagado, 2)
-    if imp_saldo_insoluto < 0:
-        imp_saldo_insoluto = 0.0
 
     payload = {
         "type": "P",
@@ -225,16 +231,16 @@ async def create_rep(
                 "forma_de_pago_p": rep_data.forma_pago,
                 "moneda_p": "MXN",
                 "tipo_cambio_p": 1,
-                "monto": rep_data.monto_pagado,
+                "monto": float(rep_data.monto_pagado),
                 "documentos_relacionados": [{
                     "id_documento": rep_data.uuid_factura_origen,
                     "moneda_dr": "MXN",
                     "tipo_cambio_dr": 1,
                     "metodo_de_pago_dr": "PPD",
                     "num_parcialidad": num_parcialidad,
-                    "imp_saldo_ant": imp_saldo_ant,
-                    "imp_pagado": rep_data.monto_pagado,
-                    "imp_saldo_insoluto": imp_saldo_insoluto,
+                    "imp_saldo_ant": float(rep_data.imp_saldo_ant),
+                    "imp_pagado": float(rep_data.monto_pagado),
+                    "imp_saldo_insoluto": float(rep_data.imp_saldo_insoluto),
                 }],
             }],
         },
@@ -260,5 +266,5 @@ async def create_rep(
 
     response.raise_for_status()
     result = response.json()
-    result["_imp_saldo_insoluto"] = imp_saldo_insoluto
+    result["_imp_saldo_insoluto"] = float(rep_data.imp_saldo_insoluto)
     return result

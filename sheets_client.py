@@ -329,8 +329,11 @@ def log_to_bitacora(
         "canal_id": str(int(float(canal_id))),
         "rfc_emisor": rfc_emisor,
         "rfc_receptor": rfc_receptor,
-        "monto": monto,
-        "total": total,
+        # float() explícito: puede llegar Decimal (fiscal_engine/models.py) o
+        # float (paths de error, que aún pasan montos crudos) — Supabase/JSON
+        # no serializa Decimal directamente.
+        "monto": float(monto),
+        "total": float(total),
         "requirio_revision": requirio_revision,
         "estado": estado,
         "folio_fiscal": folio_fiscal,
@@ -341,7 +344,7 @@ def log_to_bitacora(
     if uuid_factura_origen:
         row["uuid_factura_origen"] = uuid_factura_origen.upper()
     if imp_saldo_insoluto is not None:
-        row["imp_saldo_insoluto"] = imp_saldo_insoluto
+        row["imp_saldo_insoluto"] = float(imp_saldo_insoluto)
     sb.table("bitacora").upsert(row, on_conflict="id").execute()
 
 

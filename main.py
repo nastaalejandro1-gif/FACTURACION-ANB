@@ -226,6 +226,7 @@ def _build_invoice_data(draft: InvoiceDraft, client_profile, calculada: fiscal_e
             clave_unidad=cc.clave_unidad,
             precio_unitario=cc.precio_unitario,
             ieps=cc.ieps,
+            ieps_tasa=cc.ieps_tasa,
         )
         for cc in calculada.conceptos
     ]
@@ -234,8 +235,11 @@ def _build_invoice_data(draft: InvoiceDraft, client_profile, calculada: fiscal_e
         monto_antes_impuestos=calculada.subtotal,
         ieps=calculada.ieps,
         iva=calculada.iva,
+        tasa_iva=calculada.tasa_iva,
         retencion_iva=calculada.retencion_iva,
+        retencion_iva_tasa=calculada.retencion_iva_tasa,
         retencion_isr=calculada.retencion_isr,
+        retencion_isr_tasa=calculada.retencion_isr_tasa,
         total_estimado=calculada.total,
         metodo_pago=calculada.metodo_pago,
         forma_pago=calculada.forma_pago,
@@ -613,7 +617,7 @@ async def _timbre_and_deliver_rep(
     num_parcialidad: int,
 ) -> None:
     try:
-        result = await create_rep(rep_data, facturapi_key, num_parcialidad, rep_data.imp_saldo_ant)
+        result = await create_rep(rep_data, facturapi_key, num_parcialidad)
         folio = result.get("id", "")
     except httpx.HTTPStatusError as exc:
         error_msg = str(exc)[:500]
