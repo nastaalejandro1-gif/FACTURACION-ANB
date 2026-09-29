@@ -1,0 +1,43 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 637 >>
+stream
+BT /F1 10 Tf 50 750 Td (COTIZACION No. 4821) Tj
+0 -25 Td (Cliente: Distribuidora del Valle SA de CV) Tj
+0 -25 Td (Concepto: Bolsas de botana - Cantidad: 20 - Precio unitario: $45.00 - Importe: $900.00) Tj
+0 -20 Td (Concepto: Flete y manejo - Cantidad: 1 - Precio unitario: $200.00 - Importe: $200.00) Tj
+0 -20 Td (Subtotal: $1,100.00) Tj
+0 -20 Td (IVA 16%: $176.00) Tj
+0 -20 Td (Total: $1,276.00) Tj
+0 -25 Td (Condiciones de pago: 50% anticipo, 50% contra entrega) Tj
+0 -20 Td (Vigencia de la cotizacion: 15 dias naturales) Tj
+0 -20 Td (Tiempo de entrega: 5 dias habiles) Tj
+0 -20 Td (Atentamente, Departamento de Ventas Sin Culpa) Tj
+ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000311 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+999
+%%EOF

@@ -271,7 +271,33 @@ def run_conversation_turn(
                     })
                     continue  # let Claude retry
 
-                # Strip binary from history before second call (saves tokens)
+                # Ahorro de costo: NO se hace una segunda llamada a la API solo
+                # para generar el texto de confirmación. Claude ya incluye ese
+                # texto junto con el tool_use en ESTA MISMA respuesta (se lo
+                # pedimos explícitamente en el prompt — "Tu mensaje de
+                # respuesta DEBE ser exactamente..."), confirmado empíricamente:
+                # el modelo devuelve un bloque de texto + el tool_use en la
+                # misma respuesta. Esto elimina una llamada completa a la API
+                # (con su round-trip de latencia) por cada factura/REP generado.
+                client_message = extract_text_from_response(response) or "Tu solicitud ha sido procesada."
+
+                # Aun así hay que registrar el tool_result en el historial
+                # (aunque no se vuelva a llamar a la API en este turno): la
+                # API exige un tool_result por cada tool_use antes de la
+                # PRÓXIMA llamada — si no se guarda, el siguiente turno del
+                # cliente rompe la conversación (mismo bug que
+                # disable_parallel_tool_use/tool_choice="none" evitan arriba).
+                history.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_block.id,
+                        "content": "Datos recibidos correctamente.",
+                    }],
+                })
+
+                # Strip binary del historial ya guardado — reduce el costo del
+                # PRÓXIMO turno de este cliente.
                 for i, msg in enumerate(history):
                     if isinstance(msg.get("content"), list):
                         history[i]["content"] = [
@@ -280,41 +306,6 @@ def run_conversation_turn(
                             for b in msg["content"]
                         ]
 
-                history.append({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tool_block.id,
-                        "content": "Datos recibidos correctamente. Envía el mensaje de confirmación al cliente.",
-                    }],
-                })
-
-                # tool_choice="none": esta llamada es SOLO para generar el
-                # texto de confirmación tras un tool_use ya resuelto. Si
-                # Claude tuviera OTRA acción pendiente (ej. una segunda
-                # solicitud que el cliente mezcló en el mismo mensaje) y se
-                # le permitiera llamar una tool aquí, el código no la
-                # procesaría (no hay manejo de tool_use en esta rama) y
-                # quedaría huérfana en el historial, rompiendo la
-                # conversación en el siguiente turno — mismo bug de fondo
-                # que disable_parallel_tool_use resuelve arriba, pero en
-                # este segundo punto de entrada.
-                final_response = client.messages.create(
-                    model=ANTHROPIC_MODEL,
-                    max_tokens=1024,
-                    system=system,
-                    tools=tools,
-                    tool_choice={"type": "none"},
-                    messages=history,
-                )
-                client_message = extract_text_from_response(final_response) or "Tu solicitud ha sido procesada."
-                history.append({
-                    "role": "assistant",
-                    "content": [
-                        b.model_dump() if hasattr(b, "model_dump") else b
-                        for b in final_response.content
-                    ],
-                })
                 if isinstance(result_data, InvoiceDraft):
                     return client_message, result_data, None
                 else:
