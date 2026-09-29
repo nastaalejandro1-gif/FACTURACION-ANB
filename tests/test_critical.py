@@ -3,6 +3,8 @@ TC-01 Idempotency, TC-02 Authorization, TC-03 Pydantic validation,
 TC-04 ToolUseBlock serialization, TC-05 forma_pago enum, TC-06 webhook secret.
 """
 import json
+from decimal import Decimal
+
 import pytest
 from pydantic import ValidationError
 
@@ -15,8 +17,6 @@ from models import InvoiceData, ReceptorData, FacturaData, EmisorData
 
 VALID_INVOICE = {
     "estatus": "confirmado_por_cliente",
-    "requiere_revision": False,
-    "motivo_revision": "",
     "emisor": {
         "nombre_comercial": "Envoy",
         "razon_social": "DANTE FABRIZIO TORRES IBARRA",
@@ -274,8 +274,8 @@ VALID_REP = {
     "fecha_pago": "2026-06-01T12:00:00",
     "forma_pago": "03",
     "monto_pagado": 5652.14,
-    "requiere_revision": False,
-    "motivo_revision": "",
+    "imp_saldo_ant": 5652.14,
+    "imp_saldo_insoluto": 0.00,
 }
 
 
@@ -285,7 +285,7 @@ def test_pending_rep_detected_by_uuid_field():
     assert "uuid_factura_origen" in VALID_REP
     assert "uuid_factura_origen" not in VALID_INVOICE
     data = RepData(**VALID_REP)
-    assert data.monto_pagado == 5652.14
+    assert data.monto_pagado == Decimal("5652.14")
 
 
 def test_pending_invoice_payload_not_valid_rep():

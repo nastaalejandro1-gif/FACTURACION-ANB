@@ -1,5 +1,6 @@
 import re
-from typing import Literal
+from decimal import Decimal
+from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 RFC_PATTERN = re.compile(r"^[A-Z&Ñ]{3,4}\d{6}[A-Z0-9]{3}$")
@@ -36,23 +37,107 @@ class ReceptorData(BaseModel):
         return v
 
 
-class ConceptoItem(BaseModel):
+# ---------------------------------------------------------------------------
+# Modelos "draft" — lo único que Claude genera: extracción y clasificación.
+# Sin montos calculados (iva, retenciones, total): eso lo produce
+# fiscal_engine a partir de estos datos. Ver fiscal_engine.py.
+# ---------------------------------------------------------------------------
+
+class ConceptoDraft(BaseModel):
     descripcion: str
-    clave_prod_serv: str
     cantidad: float = Field(gt=0, default=1.0)
     clave_unidad: str = "E48"  # E48=Servicio (default despachos contables)
     precio_unitario: float = Field(gt=0)
-    ieps: float = Field(ge=0, default=0)  # IEPS de este concepto específico (0 si no aplica)
+    # Código del catálogo aprobado del cliente, o "NUEVA" si Claude no
+    # encontró ninguna clave del catálogo que aplique al concepto.
+    clave_prod_serv: str
+    clave_prod_serv_propuesta: str = ""  # obligatorio si clave_prod_serv == "NUEVA"
+
+    @model_validator(mode="after")
+    def validate_clave_nueva_requiere_propuesta(self) -> "ConceptoDraft":
+        if self.clave_prod_serv == "NUEVA" and not self.clave_prod_serv_propuesta:
+            raise ValueError(
+                "clave_prod_serv='NUEVA' requiere clave_prod_serv_propuesta "
+                "(código SAT de 8 dígitos que mejor describe el concepto)."
+            )
+        return self
+
+
+class InvoiceDraft(BaseModel):
+    estatus: Literal["confirmado_por_cliente"]
+    receptor: ReceptorData
+    conceptos: list[ConceptoDraft] = Field(min_length=1)
+    metodo_pago: Literal["PUE", "PPD"]
+    forma_pago: str
+    observaciones: str = ""
+    # Total impreso en el documento fuente (cotización), si Claude lo vio.
+    # El motor de cálculo lo usa como validación cruzada contra la suma de
+    # conceptos — ver EscalationReason.VALIDACION_ARITMETICA.
+    total_documento_fuente: Optional[float] = None
+
+    @field_validator("forma_pago")
+    @classmethod
+    def validate_forma_pago(cls, v: str) -> str:
+        if v not in FORMAS_PAGO_VALIDAS:
+            raise ValueError(
+                f"Forma de pago '{v}' no válida. Use clave SAT: "
+                f"03=Transferencia, 04=Tarjeta, 01=Efectivo, etc."
+            )
+        return v
+
+
+class RepDraft(BaseModel):
+    estatus: Literal["confirmado_por_cliente"]
+    uuid_factura_origen: str
+    receptor: ReceptorData
+    fecha_pago: str
+    forma_pago: str
+    monto_pagado: float = Field(gt=0)
+
+    @field_validator("forma_pago")
+    @classmethod
+    def validate_forma_pago_rep(cls, v: str) -> str:
+        validas = FORMAS_PAGO_VALIDAS - {"99"}
+        if v not in validas:
+            raise ValueError(
+                f"Forma de pago '{v}' no válida para REP. No puede ser '99'. "
+                "Use: 03=Transferencia, 04=Tarjeta, 01=Efectivo, etc."
+            )
+        return v
+
+    @field_validator("uuid_factura_origen")
+    @classmethod
+    def validate_uuid(cls, v: str) -> str:
+        v = v.upper().strip()
+        if not re.match(r"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$", v):
+            raise ValueError(f"UUID inválido: '{v}'. Formato esperado: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX")
+        return v
+
+
+# ---------------------------------------------------------------------------
+# Modelos finales — lo que produce fiscal_engine, listo para timbrar.
+# Todos los montos en Decimal. Los validadores de consistencia son EXACTOS
+# (no hay tolerancia): si no cuadran, es un bug del motor de cálculo, no
+# una discrepancia esperada de un LLM calculando distinto.
+# ---------------------------------------------------------------------------
+
+class ConceptoItem(BaseModel):
+    descripcion: str
+    clave_prod_serv: str
+    cantidad: Decimal = Field(gt=0, default=Decimal("1"))
+    clave_unidad: str = "E48"
+    precio_unitario: Decimal = Field(gt=0)
+    ieps: Decimal = Field(ge=0, default=Decimal("0"))
 
 
 class FacturaData(BaseModel):
     conceptos: list[ConceptoItem] = Field(min_length=1)
-    monto_antes_impuestos: float = Field(gt=0, le=10_000_000)
-    ieps: float = Field(ge=0, default=0)
-    iva: float = Field(ge=0)
-    retencion_iva: float = Field(ge=0)
-    retencion_isr: float = Field(ge=0)
-    total_estimado: float = Field(gt=0)
+    monto_antes_impuestos: Decimal = Field(gt=0, le=Decimal(10_000_000))
+    ieps: Decimal = Field(ge=0, default=Decimal("0"))
+    iva: Decimal = Field(ge=0)
+    retencion_iva: Decimal = Field(ge=0)
+    retencion_isr: Decimal = Field(ge=0)
+    total_estimado: Decimal = Field(gt=0)
     metodo_pago: Literal["PUE", "PPD"]
     forma_pago: str
     observaciones: str = ""
@@ -69,11 +154,12 @@ class FacturaData(BaseModel):
 
     @model_validator(mode="after")
     def validate_monto_conceptos(self) -> "FacturaData":
-        suma = sum(c.cantidad * c.precio_unitario for c in self.conceptos)
-        if abs(suma - self.monto_antes_impuestos) > self.monto_antes_impuestos * 0.01:
+        suma = sum((c.cantidad * c.precio_unitario for c in self.conceptos), Decimal("0"))
+        if suma != self.monto_antes_impuestos:
             raise ValueError(
-                f"monto_antes_impuestos ({self.monto_antes_impuestos:.2f}) no coincide con "
-                f"la suma de conceptos ({suma:.2f}). Diferencia > 1%."
+                f"monto_antes_impuestos ({self.monto_antes_impuestos}) no coincide "
+                f"exactamente con la suma de conceptos ({suma}). Esto es un bug del "
+                f"motor de cálculo, no una discrepancia esperada."
             )
         return self
 
@@ -88,12 +174,11 @@ class FacturaData(BaseModel):
 
     @model_validator(mode="after")
     def validate_ieps_breakdown(self) -> "FacturaData":
-        suma_ieps = sum(c.ieps for c in self.conceptos)
-        tolerancia = max(self.ieps * 0.02, 0.01)
-        if abs(suma_ieps - self.ieps) > tolerancia:
+        suma_ieps = sum((c.ieps for c in self.conceptos), Decimal("0"))
+        if suma_ieps != self.ieps:
             raise ValueError(
-                f"factura.ieps ({self.ieps:.2f}) no coincide con la suma de ieps "
-                f"por concepto ({suma_ieps:.2f}). Diferencia > 2%."
+                f"factura.ieps ({self.ieps}) no coincide exactamente con la suma de "
+                f"ieps por concepto ({suma_ieps})."
             )
         return self
 
@@ -106,18 +191,16 @@ class FacturaData(BaseModel):
             - self.retencion_iva
             - self.retencion_isr
         )
-        if abs(expected - self.total_estimado) > self.monto_antes_impuestos * 0.02:
+        if expected != self.total_estimado:
             raise ValueError(
-                f"Total estimado ({self.total_estimado}) no coincide con "
-                f"el cálculo ({expected:.2f}). Diferencia > 2%."
+                f"Total estimado ({self.total_estimado}) no coincide exactamente con "
+                f"el cálculo ({expected})."
             )
         return self
 
 
 class InvoiceData(BaseModel):
     estatus: Literal["confirmado_por_cliente"]
-    requiere_revision: bool
-    motivo_revision: str = ""
     emisor: EmisorData
     receptor: ReceptorData
     factura: FacturaData
@@ -129,9 +212,9 @@ class RepData(BaseModel):
     receptor: ReceptorData
     fecha_pago: str
     forma_pago: str
-    monto_pagado: float = Field(gt=0)
-    requiere_revision: bool = False
-    motivo_revision: str = ""
+    monto_pagado: Decimal = Field(gt=0)
+    imp_saldo_ant: Decimal = Field(ge=0)
+    imp_saldo_insoluto: Decimal = Field(ge=0)
 
     @field_validator("forma_pago")
     @classmethod
@@ -147,11 +230,20 @@ class RepData(BaseModel):
     @field_validator("uuid_factura_origen")
     @classmethod
     def validate_uuid(cls, v: str) -> str:
-        import re
         v = v.upper().strip()
         if not re.match(r"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$", v):
             raise ValueError(f"UUID inválido: '{v}'. Formato esperado: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX")
         return v
+
+    @model_validator(mode="after")
+    def validate_saldo_insoluto_consistency(self) -> "RepData":
+        expected = self.imp_saldo_ant - self.monto_pagado
+        if expected != self.imp_saldo_insoluto:
+            raise ValueError(
+                f"imp_saldo_insoluto ({self.imp_saldo_insoluto}) no coincide exactamente "
+                f"con imp_saldo_ant - monto_pagado ({expected})."
+            )
+        return self
 
 
 class ClientProfile(BaseModel):
