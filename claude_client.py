@@ -63,11 +63,15 @@ esto se enviará a revisión del despacho una sola vez, y quedará aprobado para
 facturas de este cliente.
 
 CRÍTICO — nunca "fuerces" una clave del catálogo que no corresponde solo porque es la única
-opción disponible o para evitar usar "NUEVA". Ejemplo: si el catálogo del cliente solo tiene
-claves de SERVICIOS (ej. "servicios de contabilidad") y el concepto es un PRODUCTO FÍSICO
-(ej. una bolsa, una maleta, un shaker) — o viceversa — eso es un desajuste claro: usa "NUEVA",
-no la clave de servicios. La clave equivocada en un CFDI tiene consecuencias fiscales reales;
-"NUEVA" es siempre la opción segura cuando tengas dudas.
+opción disponible o para evitar usar "NUEVA". Juzga por la DESCRIPCIÓN de cada clave del
+catálogo (lo que dice arriba, no el nombre del segmento SAT — el catálogo SAT a veces mete
+claves de mercancía dentro de segmentos que se llaman "Servicios de Gestión" o similar, así
+que el nombre del segmento NO es un indicador confiable de si es producto o servicio). Si la
+DESCRIPCIÓN de una clave del catálogo describe razonablemente el concepto, úsala — aunque el
+concepto sea un objeto físico y la clave "suene" a servicio. Usa "NUEVA" únicamente cuando
+NINGUNA descripción del catálogo corresponde al concepto. La clave equivocada en un CFDI
+tiene consecuencias fiscales reales; "NUEVA" es la opción segura ante una duda genuina, pero
+no la uses solo porque el nombre del segmento SAT te generó dudas.
 
 MANEJO DE DOCUMENTOS PDF/IMAGEN:
 Cuando el cliente envía un documento, determina qué tipo es antes de responder:

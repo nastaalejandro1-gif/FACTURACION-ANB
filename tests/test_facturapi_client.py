@@ -182,16 +182,20 @@ def _original_invoice_item(price, taxes, quantity=1):
     }
 
 
-def test_related_document_taxes_sin_ieps_usa_precio_como_base():
-    original_invoice = {"items": [_original_invoice_item(
-        price=5000,
-        taxes=[
-            {"type": "IVA", "rate": 0.16, "withholding": False},
-            {"type": "IVA", "rate": 0.017072, "withholding": True},
-            {"type": "ISR", "rate": 0.0125, "withholding": True},
-        ],
-    )]}
-    taxes = _build_related_document_taxes(original_invoice)
+def test_related_document_taxes_pago_total_sin_ieps_usa_precio_como_base():
+    """Pago total (proporción 1) — la base agregada coincide con el precio."""
+    original_invoice = {
+        "total": 5800.0,
+        "items": [_original_invoice_item(
+            price=5000,
+            taxes=[
+                {"type": "IVA", "rate": 0.16, "withholding": False},
+                {"type": "IVA", "rate": 0.017072, "withholding": True},
+                {"type": "ISR", "rate": 0.0125, "withholding": True},
+            ],
+        )],
+    }
+    taxes = _build_related_document_taxes(original_invoice, Decimal("5800.0"))
     assert len(taxes) == 3
     assert all(t["base"] == 5000.0 for t in taxes)
     ret_iva = next(t for t in taxes if t["type"] == "IVA" and t["withholding"])
@@ -199,34 +203,77 @@ def test_related_document_taxes_sin_ieps_usa_precio_como_base():
 
 
 def test_related_document_taxes_con_ieps_cascada_la_base():
-    original_invoice = {"items": [_original_invoice_item(
-        price=900,
-        taxes=[
-            {"type": "IEPS", "rate": 0.08, "withholding": False},
-            {"type": "IVA", "rate": 0.16, "withholding": False},
-        ],
-    )]}
-    taxes = _build_related_document_taxes(original_invoice)
+    original_invoice = {
+        "total": 1155.24,
+        "items": [_original_invoice_item(
+            price=900,
+            taxes=[
+                {"type": "IEPS", "rate": 0.08, "withholding": False},
+                {"type": "IVA", "rate": 0.16, "withholding": False},
+            ],
+        )],
+    }
+    taxes = _build_related_document_taxes(original_invoice, Decimal("1155.24"))
     ieps_tax = next(t for t in taxes if t["type"] == "IEPS")
     iva_tax = next(t for t in taxes if t["type"] == "IVA")
     assert ieps_tax["base"] == 900.0  # IEPS usa el precio solo
     assert iva_tax["base"] == 972.0   # IVA usa precio + IEPS ya trasladado (900 + 72)
 
 
-def test_related_document_taxes_reconstruye_monto_original_exacto():
+def test_related_document_taxes_pago_total_reconstruye_monto_original_exacto():
     """El caso real que se probó contra el sandbox: factura de $5000 con IVA,
-    retención IVA y retención ISR — el array reconstruido debe reproducir
-    exactamente iva=800.00, retención IVA=85.36, retención ISR=62.50."""
-    original_invoice = {"items": [_original_invoice_item(
-        price=5000,
-        taxes=[
-            {"type": "IVA", "rate": 0.16, "withholding": False},
-            {"type": "IVA", "rate": 0.017072, "withholding": True},
-            {"type": "ISR", "rate": 0.0125, "withholding": True},
-        ],
-    )]}
-    taxes = _build_related_document_taxes(original_invoice)
+    retención IVA y retención ISR, pagada de una sola vez — el array
+    reconstruido debe reproducir exactamente iva=800.00, retención
+    IVA=85.36, retención ISR=62.50."""
+    original_invoice = {
+        "total": 5652.14,
+        "items": [_original_invoice_item(
+            price=5000,
+            taxes=[
+                {"type": "IVA", "rate": 0.16, "withholding": False},
+                {"type": "IVA", "rate": 0.017072, "withholding": True},
+                {"type": "ISR", "rate": 0.0125, "withholding": True},
+            ],
+        )],
+    }
+    taxes = _build_related_document_taxes(original_invoice, Decimal("5652.14"))
     montos = {(t["type"], t["withholding"]): round(t["base"] * t["rate"], 2) for t in taxes}
     assert montos[("IVA", False)] == 800.00
     assert montos[("IVA", True)] == 85.36
     assert montos[("ISR", True)] == 62.50
+
+
+def test_related_document_taxes_agrupa_conceptos_con_misma_tasa():
+    """7 conceptos, todos IVA 16% sin retención — Pagos 2.0 espera UNA sola
+    línea de IVA con la base sumada, no 7 líneas repetidas."""
+    original_invoice = {
+        "total": 32938.20,
+        "items": [
+            _original_invoice_item(price=p, taxes=[{"type": "IVA", "rate": 0.16, "withholding": False}])
+            for p in (10220.00, 2590.00, 3210.00, 2345.00, 2480.00, 6350.00, 1200.00)
+        ],
+    }
+    # pago total -> proporción 1, sirve para validar la agregación en aislado
+    taxes = _build_related_document_taxes(original_invoice, Decimal("32938.20"))
+    assert len(taxes) == 1
+    assert taxes[0]["type"] == "IVA"
+    assert round(taxes[0]["base"], 2) == 28395.00
+
+
+def test_related_document_taxes_prorratea_pago_parcial():
+    """Caso real reportado: factura de $32,938.20 (7 conceptos, IVA 16%,
+    sin retenciones), pago parcial de $10,000. Sin prorratear, se manda el
+    IVA de la factura COMPLETA ($4,543.20) en cada parcialidad -- lo
+    correcto es la porción de ESTE pago: base $8,620.69, IVA $1,379.31."""
+    original_invoice = {
+        "total": 32938.20,
+        "items": [
+            _original_invoice_item(price=p, taxes=[{"type": "IVA", "rate": 0.16, "withholding": False}])
+            for p in (10220.00, 2590.00, 3210.00, 2345.00, 2480.00, 6350.00, 1200.00)
+        ],
+    }
+    taxes = _build_related_document_taxes(original_invoice, Decimal("10000"))
+    assert len(taxes) == 1
+    iva = taxes[0]
+    assert round(iva["base"], 2) == 8620.69
+    assert round(iva["base"] * iva["rate"], 2) == 1379.31

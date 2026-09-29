@@ -239,24 +239,45 @@ async def search_invoice_by_uuid(uuid: str, facturapi_key: str) -> Optional[dict
         return None
 
 
-def _build_related_document_taxes(original_invoice: dict) -> list:
+def _build_related_document_taxes(original_invoice: dict, monto_pagado: Decimal) -> list:
     """
     Reconstruye el array `taxes` que el complemento de pago debe declarar
-    por cada tipo/tasa de impuesto que tenía la factura original — SAT lo
-    usa para reconciliar que el REP no invente ni omita impuestos respecto
-    al CFDI que referencia.
+    para el documento relacionado — SAT (Pagos 2.0) lo usa para reconciliar
+    el REP contra la factura que referencia. Dos reglas, verificadas con un
+    caso real (factura de $32,938.20, pago parcial de $10,000, receptor
+    LOFT FITNESS):
+
+    1. AGRUPAR por combinación (tipo, tasa, retención) — un solo TrasladoDR/
+       RetencionDR por combinación, NUNCA uno por concepto de la factura
+       original. Si la factura tiene 7 conceptos todos con IVA 16%, esto es
+       UNA sola línea de IVA con la base sumada, no 7 líneas repetidas.
+    2. PRORRATEAR cada base agregada por (monto_pagado / total_factura). El
+       impuesto de un DoctoRelacionado es el que corresponde a ESTE pago,
+       no a la factura completa — si se manda la base completa en cada
+       parcialidad, el IVA se duplica en cada pago subsecuente y el
+       cliente reconoce como cobrado más IVA del que realmente recibió.
+       Con pago total en una sola exhibición, proporción=1 y esto no se
+       nota — por eso no lo detectaron las pruebas de sandbox anteriores
+       (todas con pago completo de facturas de 1 concepto).
 
     Se arma a partir de lo que FacturAPI YA tiene guardado para esa
-    factura (search_invoice_by_uuid) en vez de recalcularlo: cada item
-    trae sus propias `taxes[]` con la tasa exacta que se usó al timbrar
-    (incluida la tasa de retención ya back-calculada, ver
-    _calcular_tasas_retencion_efectivas). `base` es null en la respuesta
-    de FacturAPI porque toma el precio del concepto por default; con IEPS
-    presente, los impuestos posteriores en esa misma línea usan
-    precio+IEPS como base (mismo comportamiento confirmado en
-    _build_taxes_for_concepto para facturas nuevas).
+    factura (search_invoice_by_uuid): cada item trae sus propias `taxes[]`
+    con la tasa exacta que se usó al timbrar (incluida la tasa de
+    retención ya back-calculada, ver _calcular_tasas_retencion_efectivas).
+    `base` es null en la respuesta de FacturAPI porque toma el precio del
+    concepto por default; con IEPS presente, los impuestos posteriores en
+    esa misma línea usan precio+IEPS como base (mismo comportamiento
+    confirmado en _build_taxes_for_concepto para facturas nuevas).
     """
-    taxes: list[dict] = []
+    invoice_total = Decimal(str(original_invoice.get("total", 0)))
+    if invoice_total <= 0:
+        raise ValueError(
+            "La factura original no tiene un total válido (>0) para prorratear los "
+            "impuestos del REP."
+        )
+    proporcion = monto_pagado / invoice_total
+
+    agregados: dict[tuple, Decimal] = {}  # (type, rate_str, withholding) -> base acumulada
     for item in original_invoice.get("items", []):
         info = item.get("product_info") or item.get("product") or {}
         item_taxes = info.get("taxes", [])
@@ -272,12 +293,20 @@ def _build_related_document_taxes(original_invoice: dict) -> list:
 
         for t in item_taxes:
             base = base_sin_ieps if t.get("type") == "IEPS" else base_con_ieps
-            taxes.append({
-                "base": float(base),
-                "type": t["type"],
-                "rate": t["rate"],
-                "withholding": bool(t.get("withholding", False)),
-            })
+            key = (t["type"], str(t["rate"]), bool(t.get("withholding", False)))
+            agregados[key] = agregados.get(key, Decimal("0")) + base
+
+    taxes = []
+    for (tipo, rate_str, withholding), base_total in agregados.items():
+        base_prorrateada = (base_total * proporcion).quantize(
+            Decimal("0.000001"), rounding=ROUND_HALF_UP
+        )
+        taxes.append({
+            "base": float(base_prorrateada),
+            "type": tipo,
+            "rate": float(Decimal(rate_str)),
+            "withholding": withholding,
+        })
     return taxes
 
 
@@ -325,7 +354,7 @@ async def create_rep(
                     "amount": float(rep_data.monto_pagado),
                     "installment": num_parcialidad,
                     "last_balance": float(rep_data.imp_saldo_ant),
-                    "taxes": _build_related_document_taxes(original_invoice),
+                    "taxes": _build_related_document_taxes(original_invoice, rep_data.monto_pagado),
                 }],
             }],
         }],
