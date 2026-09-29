@@ -19,6 +19,7 @@ from decimal import Decimal
 
 from facturapi_client import (
     _build_facturapi_payload,
+    _build_related_document_taxes,
     _build_taxes_for_concepto,
     _calcular_tasas_retencion_efectivas,
 )
@@ -166,3 +167,66 @@ def test_ppd_fuerza_forma_pago_99_en_payload():
     payload = _build_facturapi_payload(invoice_data)
     assert payload["payment_form"] == "99"
     assert payload["payment_method"] == "PPD"
+
+
+# ---------------------------------------------------------------------------
+# REP — reconstrucción del array `taxes` para related_documents (shape real
+# verificado contra el sandbox de FacturAPI: complements/pago/related_documents,
+# no el "complemento_pago" viejo que la API ya no acepta)
+# ---------------------------------------------------------------------------
+
+def _original_invoice_item(price, taxes, quantity=1):
+    return {
+        "quantity": quantity,
+        "product_info": {"price": price, "taxes": taxes},
+    }
+
+
+def test_related_document_taxes_sin_ieps_usa_precio_como_base():
+    original_invoice = {"items": [_original_invoice_item(
+        price=5000,
+        taxes=[
+            {"type": "IVA", "rate": 0.16, "withholding": False},
+            {"type": "IVA", "rate": 0.017072, "withholding": True},
+            {"type": "ISR", "rate": 0.0125, "withholding": True},
+        ],
+    )]}
+    taxes = _build_related_document_taxes(original_invoice)
+    assert len(taxes) == 3
+    assert all(t["base"] == 5000.0 for t in taxes)
+    ret_iva = next(t for t in taxes if t["type"] == "IVA" and t["withholding"])
+    assert ret_iva["rate"] == 0.017072
+
+
+def test_related_document_taxes_con_ieps_cascada_la_base():
+    original_invoice = {"items": [_original_invoice_item(
+        price=900,
+        taxes=[
+            {"type": "IEPS", "rate": 0.08, "withholding": False},
+            {"type": "IVA", "rate": 0.16, "withholding": False},
+        ],
+    )]}
+    taxes = _build_related_document_taxes(original_invoice)
+    ieps_tax = next(t for t in taxes if t["type"] == "IEPS")
+    iva_tax = next(t for t in taxes if t["type"] == "IVA")
+    assert ieps_tax["base"] == 900.0  # IEPS usa el precio solo
+    assert iva_tax["base"] == 972.0   # IVA usa precio + IEPS ya trasladado (900 + 72)
+
+
+def test_related_document_taxes_reconstruye_monto_original_exacto():
+    """El caso real que se probó contra el sandbox: factura de $5000 con IVA,
+    retención IVA y retención ISR — el array reconstruido debe reproducir
+    exactamente iva=800.00, retención IVA=85.36, retención ISR=62.50."""
+    original_invoice = {"items": [_original_invoice_item(
+        price=5000,
+        taxes=[
+            {"type": "IVA", "rate": 0.16, "withholding": False},
+            {"type": "IVA", "rate": 0.017072, "withholding": True},
+            {"type": "ISR", "rate": 0.0125, "withholding": True},
+        ],
+    )]}
+    taxes = _build_related_document_taxes(original_invoice)
+    montos = {(t["type"], t["withholding"]): round(t["base"] * t["rate"], 2) for t in taxes}
+    assert montos[("IVA", False)] == 800.00
+    assert montos[("IVA", True)] == 85.36
+    assert montos[("ISR", True)] == 62.50

@@ -32,13 +32,20 @@ clasifica, el código calcula (Decimal, tolerancia cero). Migrado a producción 
       auto-timbre directo) — con chequeo de seguridad de que un cliente no pueda
       aprobar la factura de otro.
 - [x] REP con sobrepago → escala en vez de recortar el saldo a 0 (ver ítem de auditoría abajo).
-- [x] Tasas de impuesto exactas transportadas a FacturAPI (ya no se recalculan por división).
-- [ ] **Probar contra Claude real** — todo lo de arriba se probó con tests unitarios y
-      mocks; falta correr conversaciones reales (CSF + cotización) contra el sandbox de
-      Anthropic y comparar el resultado calculado contra lo que se timbraba antes.
-- [ ] **Verificar redondeo contra el Anexo 20** con 2-3 casos timbrados en sandbox de
-      FacturAPI, comparados centavo a centavo (la regla ROUND_HALF_UP por concepto está
-      implementada pero no verificada contra un timbrado real).
+- [x] **Probar contra Claude real** — 3 conversaciones reales (Sin Culpa) contra el sandbox
+      de Anthropic: flujo normal con claves del catálogo, clave fuera de catálogo (escala a
+      "NUEVA" correctamente), y fuera de alcance (nota de crédito → mensaje fijo). Los 3 se
+      comportaron como se diseñó.
+- [x] **Verificar redondeo contra el Anexo 20** — timbrado real en sandbox de FacturAPI:
+      total $1,325.76 coincide centavo a centavo con lo calculado localmente.
+      🔴 **Encontró un bug real**: las retenciones (IVA/ISR) mandaban la tasa "semántica" a
+      FacturAPI, que las recalculaba contra una base distinta y devolvía un monto ~6x más
+      grande (125.05 en vez de 20.01). Corregido — ver commit "fix: retenciones en FacturAPI
+      back-calculadas". Sin este timbrado real nunca se hubiera detectado con tests unitarios.
+- [ ] **Probar REP contra el sandbox real** — el flujo de facturas de ingreso ya se validó
+      en vivo (Claude + FacturAPI); REP solo tiene cobertura de tests unitarios/mocks todavía.
+- [x] Tasas de impuesto exactas transportadas a FacturAPI (ya no se recalculan por división) —
+      excepto retenciones, que se back-calculan a propósito (ver arriba).
 - [ ] **Revisar `aplica_ieps` de claves nuevas aprobadas** — hoy el botón "Aprobar" de
       ANB siempre guarda `aplica_ieps=False` por default (más seguro que sobre-cobrar);
       si una clave nueva SÍ lleva IEPS, hay que corregirlo a mano en Supabase después de

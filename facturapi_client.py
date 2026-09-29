@@ -239,11 +239,54 @@ async def search_invoice_by_uuid(uuid: str, facturapi_key: str) -> Optional[dict
         return None
 
 
+def _build_related_document_taxes(original_invoice: dict) -> list:
+    """
+    Reconstruye el array `taxes` que el complemento de pago debe declarar
+    por cada tipo/tasa de impuesto que tenía la factura original — SAT lo
+    usa para reconciliar que el REP no invente ni omita impuestos respecto
+    al CFDI que referencia.
+
+    Se arma a partir de lo que FacturAPI YA tiene guardado para esa
+    factura (search_invoice_by_uuid) en vez de recalcularlo: cada item
+    trae sus propias `taxes[]` con la tasa exacta que se usó al timbrar
+    (incluida la tasa de retención ya back-calculada, ver
+    _calcular_tasas_retencion_efectivas). `base` es null en la respuesta
+    de FacturAPI porque toma el precio del concepto por default; con IEPS
+    presente, los impuestos posteriores en esa misma línea usan
+    precio+IEPS como base (mismo comportamiento confirmado en
+    _build_taxes_for_concepto para facturas nuevas).
+    """
+    taxes: list[dict] = []
+    for item in original_invoice.get("items", []):
+        info = item.get("product_info") or item.get("product") or {}
+        item_taxes = info.get("taxes", [])
+        qty = Decimal(str(item.get("quantity", 1)))
+        price = Decimal(str(info.get("price", 0)))
+        base_sin_ieps = qty * price
+
+        ieps_amount = Decimal("0")
+        for t in item_taxes:
+            if t.get("type") == "IEPS":
+                ieps_amount = base_sin_ieps * Decimal(str(t.get("rate", 0)))
+        base_con_ieps = base_sin_ieps + ieps_amount
+
+        for t in item_taxes:
+            base = base_sin_ieps if t.get("type") == "IEPS" else base_con_ieps
+            taxes.append({
+                "base": float(base),
+                "type": t["type"],
+                "rate": t["rate"],
+                "withholding": bool(t.get("withholding", False)),
+            })
+    return taxes
+
+
 @_facturapi_retry_write
 async def create_rep(
     rep_data: RepData,
     facturapi_key: str,
     num_parcialidad: int,
+    original_invoice: dict,
 ) -> dict:
     """
     Crea un Complemento de Pago (REP) en FacturAPI.
@@ -251,6 +294,15 @@ async def create_rep(
     rep_data ya trae imp_saldo_ant/imp_saldo_insoluto calculados por
     fiscal_engine.calcular_rep con Decimal — no se recalculan aquí, solo
     se convierten a float en la frontera JSON con FacturAPI.
+
+    original_invoice: resultado de search_invoice_by_uuid para la factura
+    referenciada — se usa para reconstruir el array `taxes` que SAT exige
+    en el documento relacionado (ver _build_related_document_taxes).
+
+    Shape del payload verificado contra el sandbox real de FacturAPI
+    (docs.facturapi.io no documenta este endpoint con el detalle
+    necesario) — "complements"/"pago"/"related_documents", no
+    "complemento_pago" (formato viejo, ya no existe en la API).
     """
     if not facturapi_key:
         raise ValueError("El cliente no tiene configurada una API key de FacturAPI.")
@@ -263,26 +315,20 @@ async def create_rep(
             "tax_system": rep_data.receptor.regimen_fiscal,
             "address": {"zip": rep_data.receptor.cp_fiscal},
         },
-        "payment_form": rep_data.forma_pago,
-        "complemento_pago": {
-            "pagos": [{
-                "fecha_pago": rep_data.fecha_pago,
-                "forma_de_pago_p": rep_data.forma_pago,
-                "moneda_p": "MXN",
-                "tipo_cambio_p": 1,
-                "monto": float(rep_data.monto_pagado),
-                "documentos_relacionados": [{
-                    "id_documento": rep_data.uuid_factura_origen,
-                    "moneda_dr": "MXN",
-                    "tipo_cambio_dr": 1,
-                    "metodo_de_pago_dr": "PPD",
-                    "num_parcialidad": num_parcialidad,
-                    "imp_saldo_ant": float(rep_data.imp_saldo_ant),
-                    "imp_pagado": float(rep_data.monto_pagado),
-                    "imp_saldo_insoluto": float(rep_data.imp_saldo_insoluto),
+        "complements": [{
+            "type": "pago",
+            "data": [{
+                "payment_form": rep_data.forma_pago,
+                "date": rep_data.fecha_pago,
+                "related_documents": [{
+                    "uuid": rep_data.uuid_factura_origen,
+                    "amount": float(rep_data.monto_pagado),
+                    "installment": num_parcialidad,
+                    "last_balance": float(rep_data.imp_saldo_ant),
+                    "taxes": _build_related_document_taxes(original_invoice),
                 }],
             }],
-        },
+        }],
     }
 
     logger.info("FacturAPI REP payload: %s", payload)

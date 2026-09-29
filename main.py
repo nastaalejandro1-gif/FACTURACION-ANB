@@ -605,7 +605,9 @@ async def _calcular_y_timbrar_rep(
         imp_saldo_ant=resultado.rep.imp_saldo_ant,
         imp_saldo_insoluto=resultado.rep.imp_saldo_insoluto,
     )
-    await _timbre_and_deliver_rep(invoice_id, rep_data, client_profile, chat_id, facturapi_key, num_parcialidad)
+    await _timbre_and_deliver_rep(
+        invoice_id, rep_data, client_profile, chat_id, facturapi_key, num_parcialidad, original_invoice
+    )
 
 
 async def _timbre_and_deliver_rep(
@@ -615,9 +617,10 @@ async def _timbre_and_deliver_rep(
     chat_id: str,
     facturapi_key: str,
     num_parcialidad: int,
+    original_invoice: dict,
 ) -> None:
     try:
-        result = await create_rep(rep_data, facturapi_key, num_parcialidad)
+        result = await create_rep(rep_data, facturapi_key, num_parcialidad, original_invoice)
         folio = result.get("id", "")
     except httpx.HTTPStatusError as exc:
         error_msg = str(exc)[:500]
