@@ -172,8 +172,12 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
 
     except Exception as exc:
         error_str = str(exc)
-        # Historial corrupto (tool_result sin tool_use correspondiente) — limpiar y pedir reintento
-        if "tool_use_id" in error_str and "tool_result" in error_str:
+        # Historial corrupto (tool_use/tool_result desparejados — ver el fix
+        # de disable_parallel_tool_use en claude_client.py, esto es la red
+        # de seguridad por si algo similar vuelve a pasar por otra causa) —
+        # limpiar y pedir reintento en vez de dejar al cliente atascado para
+        # siempre (el historial roto ya habría quedado guardado).
+        if "tool_result" in error_str and "tool_use" in error_str:
             logger.warning("Historial corrupto para %s — limpiando y pidiendo reintento", chat_id)
             history.clear()
             await telegram_client.send_message(

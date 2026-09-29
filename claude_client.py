@@ -200,6 +200,15 @@ def run_conversation_turn(
     }]
 
     tools = build_invoice_tools([c.clave_prod_serv for c in catalogo])
+    # Claude a veces intenta resolver 2 pedidos del cliente en un mismo turno
+    # (ej. "REP de la factura X y además una factura nueva para Y") llamando
+    # 2 tools en paralelo. El código de abajo solo procesa la primera, y la
+    # segunda queda como tool_use sin tool_result — la API rechaza el
+    # siguiente turno y la conversación queda rota permanentemente (el
+    # historial corrupto ya se guardó). disable_parallel_tool_use fuerza a
+    # Claude a resolver un pedido por turno, sin importar cuántos junte el
+    # cliente en un solo mensaje.
+    tool_choice = {"type": "auto", "disable_parallel_tool_use": True}
 
     for cycle in range(MAX_TOOL_CYCLES):
         response = client.messages.create(
@@ -207,6 +216,7 @@ def run_conversation_turn(
             max_tokens=4096,
             system=system,
             tools=tools,
+            tool_choice=tool_choice,
             messages=history,
         )
 
@@ -262,11 +272,22 @@ def run_conversation_turn(
                     }],
                 })
 
+                # tool_choice="none": esta llamada es SOLO para generar el
+                # texto de confirmación tras un tool_use ya resuelto. Si
+                # Claude tuviera OTRA acción pendiente (ej. una segunda
+                # solicitud que el cliente mezcló en el mismo mensaje) y se
+                # le permitiera llamar una tool aquí, el código no la
+                # procesaría (no hay manejo de tool_use en esta rama) y
+                # quedaría huérfana en el historial, rompiendo la
+                # conversación en el siguiente turno — mismo bug de fondo
+                # que disable_parallel_tool_use resuelve arriba, pero en
+                # este segundo punto de entrada.
                 final_response = client.messages.create(
                     model=ANTHROPIC_MODEL,
                     max_tokens=1024,
                     system=system,
                     tools=tools,
+                    tool_choice={"type": "none"},
                     messages=history,
                 )
                 client_message = extract_text_from_response(final_response) or "Tu solicitud ha sido procesada."
