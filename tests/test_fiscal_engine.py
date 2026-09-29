@@ -189,6 +189,41 @@ def test_escalamiento_por_regimen_incongruente_con_rfc():
     assert resultado.escalation.reason == EscalationReason.VALIDACION_ARITMETICA
 
 
+def test_omitir_validacion_cruzada_permite_regimen_incongruente():
+    receptor_incongruente = ReceptorData(
+        razon_social="Empresa SA de CV",
+        rfc="EMP010101AA1",
+        regimen_fiscal="612",
+        cp_fiscal="06600",
+        uso_cfdi="G03",
+    )
+    conceptos = [ConceptoExtraido(
+        descripcion="Servicio", cantidad=Decimal("1"),
+        precio_unitario=Decimal("1000.00"), clave_unidad="E48",
+        clave_prod_serv="78101803",
+    )]
+    resultado = calcular_factura(
+        conceptos, receptor_incongruente, REGLAS_SIN_IEPS_SIN_RETENCION, "PUE", "03",
+        omitir_validacion_cruzada=True,
+    )
+    assert resultado.escalation is None
+    assert resultado.factura.total == Decimal("1160.00")
+
+
+def test_omitir_validacion_cruzada_tambien_omite_total_fuente():
+    conceptos = [ConceptoExtraido(
+        descripcion="Servicio", cantidad=Decimal("1"),
+        precio_unitario=Decimal("5000.00"), clave_unidad="E48",
+        clave_prod_serv="78101803",
+    )]
+    resultado = calcular_factura(
+        conceptos, RECEPTOR_PF, REGLAS_SIN_IEPS_SIN_RETENCION, "PUE", "03",
+        total_documento_fuente=Decimal("999.00"),
+        omitir_validacion_cruzada=True,
+    )
+    assert resultado.escalation is None
+
+
 def test_calcular_factura_requiere_al_menos_un_concepto():
     with pytest.raises(ValueError):
         calcular_factura([], RECEPTOR_PF, REGLAS_SIN_IEPS_SIN_RETENCION, "PUE", "03")

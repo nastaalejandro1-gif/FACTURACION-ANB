@@ -130,7 +130,16 @@ def calcular_factura(
     metodo_pago: str,
     forma_pago: str,
     total_documento_fuente: Optional[Decimal] = None,
+    omitir_validacion_cruzada: bool = False,
 ) -> FiscalCalculationResult:
+    """
+    omitir_validacion_cruzada: se usa SOLO cuando ANB ya revisó manualmente
+    una escalación por VALIDACION_ARITMETICA y aprobó proceder de todas
+    formas (ver main.py::_calcular_y_procesar_factura). Nunca lo pone
+    Claude ni el cliente — es una decisión humana explícita y queda
+    registrada en la bitácora. Los montos siempre se calculan igual; lo
+    único que se salta son los chequeos de consistencia previos.
+    """
     if not conceptos:
         raise ValueError("calcular_factura requiere al menos un concepto")
 
@@ -138,7 +147,7 @@ def calcular_factura(
     # No es "duda fiscal" del prompt: es el motor detectando una inconsistencia
     # de datos real, mapeada a VALIDACION_ARITMETICA (validación cruzada).
     tipo_persona = tipo_persona_from_rfc(receptor.rfc)
-    if not regimen_coincide_con_tipo_persona(receptor.regimen_fiscal, tipo_persona):
+    if not omitir_validacion_cruzada and not regimen_coincide_con_tipo_persona(receptor.regimen_fiscal, tipo_persona):
         return FiscalCalculationResult(escalation=EscalationDetail(
             reason=EscalationReason.VALIDACION_ARITMETICA,
             detail=(
@@ -165,7 +174,7 @@ def calcular_factura(
     subtotal = sum((cc.importe for cc in conceptos_calculados), Decimal("0.00"))
     ieps_total = sum((cc.ieps for cc in conceptos_calculados), Decimal("0.00"))
 
-    if total_documento_fuente is not None and abs(subtotal - total_documento_fuente) > CENTAVO:
+    if not omitir_validacion_cruzada and total_documento_fuente is not None and abs(subtotal - total_documento_fuente) > CENTAVO:
         return FiscalCalculationResult(escalation=EscalationDetail(
             reason=EscalationReason.VALIDACION_ARITMETICA,
             detail=(

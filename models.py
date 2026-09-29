@@ -63,9 +63,7 @@ class ConceptoDraft(BaseModel):
         return self
 
 
-class InvoiceDraft(BaseModel):
-    estatus: Literal["confirmado_por_cliente"]
-    receptor: ReceptorData
+class FacturaDraft(BaseModel):
     conceptos: list[ConceptoDraft] = Field(min_length=1)
     metodo_pago: Literal["PUE", "PPD"]
     forma_pago: str
@@ -84,6 +82,12 @@ class InvoiceDraft(BaseModel):
                 f"03=Transferencia, 04=Tarjeta, 01=Efectivo, etc."
             )
         return v
+
+
+class InvoiceDraft(BaseModel):
+    estatus: Literal["confirmado_por_cliente"]
+    receptor: ReceptorData
+    factura: FacturaDraft
 
 
 class RepDraft(BaseModel):
@@ -267,3 +271,31 @@ class ClientProfile(BaseModel):
     notas_fiscales: str
     activo: bool
     facturapi_key: str  # API key de la organización del cliente en FacturAPI
+
+
+class PendingPayload(BaseModel):
+    """
+    Envoltura que se guarda en pendientes.invoice_json cuando el motivo es
+    'anb_revision' (escalamiento). Guarda el DRAFT (extracción pre-cálculo,
+    nunca montos ya calculados) más el motivo de escalación, para que
+    main.py pueda reconstruirlo y volver a intentar el cálculo cuando ANB
+    aprueba — ver main.py::_calcular_y_procesar_factura /
+    _calcular_y_timbrar_rep.
+
+    Para 'cliente_confirmacion' NO se usa este envoltorio: invoice_json es
+    directamente InvoiceData/RepData ya calculado (formato sin cambios
+    respecto al que ya usaba /aprobar de ANB).
+    """
+    tipo: Literal["ingreso", "rep"]
+    escalation_reason: str
+    escalation_detail: str
+    invoice_draft: Optional[InvoiceDraft] = None
+    rep_draft: Optional[RepDraft] = None
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "PendingPayload":
+        if self.tipo == "ingreso" and self.invoice_draft is None:
+            raise ValueError("tipo='ingreso' requiere invoice_draft")
+        if self.tipo == "rep" and self.rep_draft is None:
+            raise ValueError("tipo='rep' requiere rep_draft")
+        return self
