@@ -209,3 +209,89 @@ async def test_cliente_legitimo_si_puede_confirmar(monkeypatch):
     await main.handle_callback_query(callback_query)
 
     assert ejecutado == [("cliente_si", "inv-3")]
+
+
+# ---------------------------------------------------------------------------
+# REP también pasa por confirmación del cliente (pedido explícito: "el botón
+# de confirmación si hay que ponerlo también a los REPs")
+# ---------------------------------------------------------------------------
+
+REP_DRAFT_RECEPTOR = ReceptorData(
+    razon_social="Distribuidora del Valle SA de CV", rfc="DVA010101AA1",
+    regimen_fiscal="601", cp_fiscal="06600", uso_cfdi="CP01",
+)
+
+
+def _rep_draft(monto_pagado: float = 1000.0):
+    from models import RepDraft
+    return RepDraft(
+        estatus="confirmado_por_cliente",
+        uuid_factura_origen="C8171E7E-283A-4AC7-BF7F-5584051E5A9D",
+        receptor=REP_DRAFT_RECEPTOR,
+        fecha_pago="2026-09-29T12:00:00",
+        forma_pago="03",
+        monto_pagado=monto_pagado,
+    )
+
+
+@pytest.mark.asyncio
+async def test_rep_limpio_pide_confirmacion_al_cliente_no_timbra_directo(monkeypatch):
+    sent, saved_pending, _ = _patch_common(monkeypatch)
+
+    async def fake_search(uuid, key):
+        return {"total": 5000.0}
+    monkeypatch.setattr(main, "search_invoice_by_uuid", fake_search)
+    monkeypatch.setattr(main.sheets_client, "get_rep_history", lambda uuid: [])
+
+    timbrado = []
+    async def fake_timbre_rep(*a, **kw):
+        timbrado.append((a, kw))
+    monkeypatch.setattr(main, "_timbre_and_deliver_rep", fake_timbre_rep)
+
+    draft = _rep_draft(monto_pagado=1000.0)
+    await main._calcular_y_timbrar_rep("rep-1", draft, CLIENT_PROFILE, "555", 1)
+
+    assert timbrado == []  # nunca timbra directo
+    assert len(saved_pending) == 1
+    assert saved_pending[0]["tipo_aprobacion"] == "cliente_confirmacion"
+    assert saved_pending[0]["canal_id_aprobador"] == "555"
+    assert any("complemento de pago" in text.lower() for _, text, _ in sent)
+
+
+@pytest.mark.asyncio
+async def test_confirmacion_cliente_de_rep_reconstruye_fresco_y_timbra(monkeypatch):
+    """Al confirmar, se re-busca la factura original y el historial de REPs
+    frescos (no se reusa lo calculado al momento de la vista previa)."""
+    sent, _, _ = _patch_common(monkeypatch)
+    monkeypatch.setattr(main.sheets_client, "get_client_by_canal_id", lambda canal, cid: CLIENT_PROFILE)
+    monkeypatch.setattr(main.sheets_client, "update_pending_status", lambda *a, **kw: None)
+
+    async def fake_search(uuid, key):
+        return {"total": 5000.0}
+    monkeypatch.setattr(main, "search_invoice_by_uuid", fake_search)
+    monkeypatch.setattr(main.sheets_client, "get_rep_history", lambda uuid: [])
+
+    timbrado = []
+    async def fake_timbre_rep(invoice_id, rep_data, client_profile, chat_id, facturapi_key, num_parcialidad, original_invoice):
+        timbrado.append((invoice_id, rep_data, num_parcialidad, original_invoice))
+    monkeypatch.setattr(main, "_timbre_and_deliver_rep", fake_timbre_rep)
+
+    rep_data = main.RepData(
+        estatus="confirmado_por_cliente",
+        uuid_factura_origen="C8171E7E-283A-4AC7-BF7F-5584051E5A9D",
+        receptor=REP_DRAFT_RECEPTOR,
+        fecha_pago="2026-09-29T12:00:00", forma_pago="03",
+        monto_pagado=Decimal("1000.00"), imp_saldo_ant=Decimal("1000.00"),
+        imp_saldo_insoluto=Decimal("0.00"),
+    )
+    pending = {
+        "id": "rep-1", "estado": "pendiente", "canal_id": "555", "canal": "telegram",
+        "invoice_json": rep_data.model_dump_json(), "telegram_message_id": 0,
+    }
+    await main._execute_client_confirmation("cliente_si", "rep-1", pending)
+
+    assert len(timbrado) == 1
+    invoice_id, rep_data_out, num_parcialidad, original_invoice = timbrado[0]
+    assert invoice_id == "rep-1"
+    assert num_parcialidad == 1
+    assert original_invoice == {"total": 5000.0}

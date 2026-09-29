@@ -605,8 +605,39 @@ async def _calcular_y_timbrar_rep(
         imp_saldo_ant=resultado.rep.imp_saldo_ant,
         imp_saldo_insoluto=resultado.rep.imp_saldo_insoluto,
     )
-    await _timbre_and_deliver_rep(
-        invoice_id, rep_data, client_profile, chat_id, facturapi_key, num_parcialidad, original_invoice
+    await _solicitar_confirmacion_cliente_rep(invoice_id, rep_data, client_profile, chat_id, message_id)
+
+
+async def _solicitar_confirmacion_cliente_rep(
+    invoice_id: str, rep_data: RepData, client_profile, chat_id: str, message_id: int
+) -> None:
+    await asyncio.to_thread(
+        sheets_client.save_pending,
+        invoice_id=invoice_id,
+        canal="telegram",
+        canal_id=chat_id,
+        telegram_message_id=message_id,
+        invoice_json=rep_data.model_dump_json(),
+        motivo_revision="",
+        tipo_aprobacion="cliente_confirmacion",
+        canal_id_aprobador=chat_id,
+    )
+    lineas = [
+        "💳 Resumen de tu complemento de pago (REP):",
+        "",
+        f"Factura original: {rep_data.uuid_factura_origen}",
+        f"Monto pagado: ${rep_data.monto_pagado:,.2f}",
+        f"Fecha de pago: {rep_data.fecha_pago}",
+        f"Saldo insoluto después de este pago: ${rep_data.imp_saldo_insoluto:,.2f}",
+        "",
+        "¿Confirmas estos datos para timbrar el complemento de pago?",
+    ]
+    await telegram_client.send_message(
+        chat_id, "\n".join(lineas),
+        reply_markup={"inline_keyboard": [[
+            {"text": "✅ Sí, confirmar", "callback_data": f"cliente_si:{invoice_id}"},
+            {"text": "❌ No, corregir", "callback_data": f"cliente_no:{invoice_id}"},
+        ]]},
     )
 
 
@@ -855,9 +886,11 @@ async def _execute_client_confirmation(command: str, invoice_id: str, pending: d
 
     try:
         payload = json.loads(pending["invoice_json"])
-        invoice_data = InvoiceData(**payload)
+        es_rep = "uuid_factura_origen" in payload
+        invoice_data = None if es_rep else InvoiceData(**payload)
+        rep_data = RepData(**payload) if es_rep else None
     except Exception as exc:
-        logger.exception("Error reconstruyendo InvoiceData confirmada por cliente %s", invoice_id)
+        logger.exception("Error reconstruyendo datos confirmados por cliente %s", invoice_id)
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⚠️ Error al leer datos de {invoice_id}: {exc}")
         return
 
@@ -869,7 +902,36 @@ async def _execute_client_confirmation(command: str, invoice_id: str, pending: d
 
     await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "aprobado")
     message_id = int(pending.get("telegram_message_id") or 0)
-    await _timbre_and_deliver(invoice_id, invoice_data, client_profile, chat_id, message_id)
+
+    if es_rep:
+        facturapi_key = client_profile.facturapi_key if client_profile else ""
+        # Recalcular num_parcialidad y buscar la factura original FRESCOS,
+        # justo antes de timbrar — el cliente pudo tardar en confirmar y
+        # otro pago pudo haberse timbrado mientras tanto.
+        try:
+            original_invoice = await search_invoice_by_uuid(rep_data.uuid_factura_origen, facturapi_key)
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            await telegram_client.send_message(
+                chat_id,
+                "Hubo un problema de conexión al confirmar tu pago. El despacho ha sido notificado."
+            )
+            await telegram_client.send_message(
+                ALEJANDRO_CHAT_ID,
+                f"⏱️ Error de red confirmando REP {invoice_id}\n{type(exc).__name__}: {exc}"
+            )
+            return
+        if not original_invoice:
+            await telegram_client.send_message(
+                ALEJANDRO_CHAT_ID, f"⚠️ No encontré la factura original al confirmar REP {invoice_id}."
+            )
+            return
+        previous_reps = await asyncio.to_thread(sheets_client.get_rep_history, rep_data.uuid_factura_origen)
+        num_parcialidad = len(previous_reps) + 1
+        await _timbre_and_deliver_rep(
+            invoice_id, rep_data, client_profile, chat_id, facturapi_key, num_parcialidad, original_invoice
+        )
+    else:
+        await _timbre_and_deliver(invoice_id, invoice_data, client_profile, chat_id, message_id)
 
 
 async def handle_callback_query(callback_query: dict) -> None:
