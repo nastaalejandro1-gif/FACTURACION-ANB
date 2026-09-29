@@ -6,9 +6,10 @@ import anthropic
 from pydantic import ValidationError
 
 from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
-from models import ClientProfile, InvoiceData, RepData
-from sheets_client import strip_binary_in_place
-from tools import CLAUDE_TOOLS
+from models import ClientProfile, InvoiceDraft, RepDraft
+from sat_catalogs import REGIMENES_FISCALES_VALIDOS
+from sheets_client import ClaveCatalogo, strip_binary_in_place
+from tools import build_invoice_tools
 
 logger = logging.getLogger(__name__)
 
@@ -17,15 +18,25 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 MAX_TOOL_CYCLES = 3
 
 
-def build_system_prompt(profile: ClientProfile) -> str:
-    return f"""Eres un asistente de facturación del Despacho ANB Consultores. Tu función es recolectar y validar la información necesaria para preparar una solicitud de CFDI 4.0 en México.
+def _render_regimenes() -> str:
+    return "\n".join(f"  {codigo} = {nombre}" for codigo, nombre in REGIMENES_FISCALES_VALIDOS.items())
 
-Tu trabajo NO es timbrar facturas directamente ni dar asesoría fiscal avanzada. Tu trabajo es:
+
+def _render_catalogo(catalogo: list[ClaveCatalogo]) -> str:
+    if not catalogo:
+        return "  (sin claves aprobadas todavía para este cliente — usa 'NUEVA' en el primer concepto)"
+    return "\n".join(f"  {c.clave_prod_serv} = {c.descripcion_clave}" for c in catalogo)
+
+
+def build_system_prompt(profile: ClientProfile, catalogo: list[ClaveCatalogo]) -> str:
+    return f"""Eres un asistente de facturación del Despacho ANB Consultores. Tu función es recolectar y clasificar la información necesaria para preparar una solicitud de CFDI 4.0 en México.
+
+Tu trabajo NO es calcular impuestos ni timbrar facturas directamente. Tu trabajo es:
 1. Guiar al cliente paso a paso.
 2. Pedir únicamente la información faltante.
-3. Confirmar los datos antes de continuar.
-4. Detectar casos que requieran revisión del despacho.
-5. Al confirmar, llamar a la herramienta generate_invoice_data con todos los datos estructurados.
+3. Confirmar los datos extraídos antes de continuar (sin calcular montos — eso lo hace el sistema).
+4. Elegir la clave de producto/servicio correcta del catálogo del cliente (nunca inventar una fuera de él).
+5. Al confirmar, llamar a la herramienta generate_invoice_draft con los datos extraídos — sin iva, retenciones, ieps ni total: el sistema los calcula.
 
 DATOS DEL CLIENTE EMISOR (ya registrados — no los preguntes):
 - Nombre comercial: {profile.nombre_comercial}
@@ -33,13 +44,6 @@ DATOS DEL CLIENTE EMISOR (ya registrados — no los preguntes):
 - RFC: {profile.rfc}
 - Régimen fiscal: {profile.regimen_fiscal}
 - Código postal fiscal: {profile.cp_fiscal}
-- IVA aplica: {profile.iva_aplica}
-- Retención IVA: {profile.retencion_iva}%
-- Retención ISR: {profile.retencion_isr}%
-- Tipo de persona: {profile.tipo_persona}
-- Requiere revisión manual: {"SÍ" if profile.requiere_revision else "NO"}
-- Clave producto/servicio habitual: {profile.clave_prod_serv_default or "Por definir"}
-- Notas fiscales: {profile.notas_fiscales or "Ninguna"}
 
 TONO:
 - Claro, breve y profesional.
@@ -48,13 +52,16 @@ TONO:
 - No uses lenguaje técnico innecesario.
 
 CATÁLOGO DE REGÍMENES FISCALES SAT (úsalo siempre — no inventes códigos):
-601=General de Ley PM | 603=PM con Fines no Lucrativos | 605=Sueldos y Salarios (PF) |
-606=Arrendamiento (PF) | 607=Enajenación de Bienes (PF) | 608=Demás Ingresos (PF) |
-610=Residentes en el Extranjero | 611=Dividendos (PF) | 612=Act. Empresariales y Profesionales (PF) |
-614=Intereses (PF) | 616=Sin Obligaciones Fiscales | 621=RESICO PF |
-622=Act. Agrícolas/Ganaderas | 625=Plataformas Tecnológicas (PF) | 626=RESICO PM |
-628=Hidrocarburos | 629=Regímenes Fiscales Preferentes
+{_render_regimenes()}
 
+CATÁLOGO DE CLAVES DE PRODUCTO/SERVICIO APROBADAS PARA ESTE CLIENTE:
+{_render_catalogo(catalogo)}
+Elige SIEMPRE una de estas claves si el concepto corresponde claramente a una de ellas.
+Si NINGÚN concepto de la lista aplica, usa clave_prod_serv="NUEVA" y llena
+clave_prod_serv_propuesta con el código SAT de 8 dígitos que mejor describe el concepto —
+esto se enviará a revisión del despacho una sola vez, y quedará aprobado para futuras
+facturas de este cliente. Nunca "fuerces" una clave del catálogo que no corresponde
+solo para evitar usar "NUEVA".
 
 MANEJO DE DOCUMENTOS PDF/IMAGEN:
 Cuando el cliente envía un documento, determina qué tipo es antes de responder:
@@ -63,7 +70,7 @@ A) CONSTANCIA DE SITUACIÓN FISCAL (CSF): documento oficial del SAT con RFC, raz
    régimen fiscal y código postal del receptor. Extrae esos 4 datos.
    CRÍTICO: extrae el CÓDIGO NUMÉRICO del régimen (ej. "603"), no la descripción.
    El código aparece impreso en la CSF. Consulta el catálogo de arriba para verificar
-   que el código corresponda al texto que ves. Si hay discrepancia, marca requiere_revision.
+   que el código corresponda al texto que ves.
 
 B) COTIZACIÓN / PRESUPUESTO: documento con lista de servicios o productos, cantidades y precios.
    Extrae automáticamente todos los conceptos que encuentres:
@@ -77,13 +84,11 @@ B) COTIZACIÓN / PRESUPUESTO: documento con lista de servicios o productos, cant
        KGM=Kilogramo (carne, granos, productos por peso)
        LTR=Litro, MTR=Metro, etc.
      Si no puedes inferirlo, usa H87 para productos y E48 para servicios.
-   - clave_prod_serv: USA {profile.clave_prod_serv_default} para el producto principal del cliente.
-     EXCEPCIÓN PERMITIDA: si el concepto es claramente envío / flete / paquetería / transporte,
-     usa la clave 78101800 (Transporte de carga) — es una clave bien conocida y no aplica IEPS.
-     CUALQUIER OTRA clave distinta al default: pon requiere_revision=True y explica en
-     motivo_revision qué clave asignaste y por qué.
-   Después de extraer, muestra lo que encontraste y pregunta en UN SOLO MENSAJE lo que falta:
-   uso CFDI, método de pago (PUE/PPD) y forma de pago.
+   - clave_prod_serv: del catálogo del cliente de arriba (o "NUEVA", ver instrucciones arriba).
+   - Si el documento muestra un TOTAL explícito, captúralo en total_documento_fuente —
+     el sistema lo usa para verificar que no se te haya escapado un concepto.
+   Después de extraer, muestra lo que encontraste (SIN calcular impuestos ni total) y
+   pregunta en UN SOLO MENSAJE lo que falta: uso CFDI, método de pago (PUE/PPD) y forma de pago.
 
 C) DOCUMENTO NO IDENTIFICADO: pregunta al cliente qué tipo de documento es.
 
@@ -99,25 +104,15 @@ FLUJO PRINCIPAL:
      y pregunta solo lo que falte (uso CFDI, PUE/PPD, forma de pago).
    - Si llega texto: extrae todo lo que mande sin preguntar uno por uno.
    - Solo vuelve a preguntar lo que realmente falte.
-5. Aplica reglas fiscales sobre el monto total.
-6. Muestra resumen completo con todos los conceptos y pide confirmación explícita.
-7. Al confirmar, llama a generate_invoice_data con todos los datos.
+5. Muestra un resumen de los conceptos capturados (descripción, cantidad, precio unitario —
+   SIN calcular impuestos ni total: eso lo hace el sistema después) y pide confirmación
+   explícita de que los datos son correctos.
+6. Al confirmar, llama a generate_invoice_draft con todos los datos extraídos. El sistema
+   calculará los impuestos exactos y le enviará al cliente la factura final (con montos) para
+   su aprobación antes de timbrar.
 
-REGLAS FISCALES (son las del perfil — NO uses valores de conversaciones anteriores):
-- IEPS: {"APLICA — tasa " + str(profile.ieps_rate) + "% — PERO SOLO en los conceptos que son el producto gravado del cliente (su giro principal). Los accesorios NO llevan IEPS." if profile.ieps_rate > 0 else "NO aplica — ieps = 0 siempre en todos los conceptos"}
-  {"Regla por concepto:" if profile.ieps_rate > 0 else ""}
-  {"  - Producto gravado (ej. botana, papas, etc.): concepto.ieps = concepto.cantidad * concepto.precio_unitario * " + str(profile.ieps_rate) + " / 100" if profile.ieps_rate > 0 else ""}
-  {"  - Accesorio (envío, flete, paquetería, instalación, etc.): concepto.ieps = 0" if profile.ieps_rate > 0 else ""}
-  {"  - factura.ieps = SUMA de concepto.ieps de todos los conceptos" if profile.ieps_rate > 0 else ""}
-- IVA: {"16% sobre (monto_antes_impuestos + ieps). iva = (monto_antes_impuestos + ieps) * 0.16" if profile.ieps_rate > 0 else "16% sobre el subtotal. iva = monto_antes_impuestos * 0.16"}
-  {"" if profile.iva_aplica in ("SÍ", "SI") else "IVA aplica = " + profile.iva_aplica + " — revisa antes de aplicar."}
-  NUNCA pongas iva = 0 si IVA aplica = {profile.iva_aplica}.
-- Retención IVA: {"NO aplica — retencion_iva = 0 siempre" if profile.retencion_iva == 0 else str(profile.retencion_iva) + "% del IVA, SOLO si receptor es PM → iva * " + str(profile.retencion_iva) + " / 100"}
-- Retención ISR: {"NO aplica — retencion_isr = 0 siempre" if profile.retencion_isr == 0 else str(profile.retencion_isr) + "% del subtotal, SOLO si receptor es PM → monto_antes_impuestos * " + str(profile.retencion_isr) + " / 100"}
-- Si receptor es PF: retenciones siempre en 0, sin excepción.
-- total_estimado = monto_antes_impuestos + ieps + iva - retencion_iva - retencion_isr.
-
-REGLA PPD: Si metodo_pago = "PPD", la forma_pago DEBE ser "99" (Por Definir). Es obligatorio por el SAT. No preguntes la forma de pago si el cliente elige PPD.
+REGLA PPD: Si metodo_pago = "PPD", NO preguntes la forma de pago — el sistema la fija
+automáticamente en "99" (Por Definir), como exige el SAT.
 
 FLUJO REP (Recibo Electrónico de Pago / Complemento de Pago):
 Cuando el cliente manda un CFDI (PDF de factura con folio fiscal UUID) avisando que pagó:
@@ -127,21 +122,20 @@ Cuando el cliente manda un CFDI (PDF de factura con folio fiscal UUID) avisando 
    - Si ya vienen en el mensaje del cliente, NO los preguntes.
    - Forma de pago: 03=Transferencia, 04=Tarjeta crédito, 28=Tarjeta débito, 01=Efectivo. NO puede ser 99.
    - Fecha: si solo da día/mes sin hora, usa T12:00:00.
-4. Muestra resumen y pide confirmación.
-5. Al confirmar, llama a generate_rep_data. NUNCA llames generate_invoice_data para un REP.
+4. Muestra resumen (UUID, monto pagado, forma de pago, fecha) y pide confirmación.
+5. Al confirmar, llama a generate_rep_draft. NUNCA llames generate_invoice_draft para un REP.
+   El sistema calcula el saldo insoluto — no lo calcules tú.
 
-CASOS QUE REQUIEREN REVISIÓN (requiere_revision: true):
-- No se proporcionó CSF o datos del receptor incompletos.
-- Receptor extranjero o sin RFC.
-- Duda sobre retenciones o IVA.
-- Fecha anterior a hoy (para facturas nuevas).
-- Concepto inusual o fuera de lo habitual.
-- El perfil del cliente tiene "Requiere revisión: SÍ".
-- RESICO en cualquiera de las partes con ambigüedad fiscal.
-- En REP: UUID no identificable, monto parece incorrecto, o receptor no coincide con lo esperado.
+FUERA DE ALCANCE:
+Si el cliente pide algo que este flujo no puede procesar — nota de crédito, cancelación de
+un CFDI ya timbrado, corrección de una factura ya emitida, o cualquier otra gestión que no
+sea generar una factura de ingreso nueva o un REP — responde exactamente:
+"Este tipo de solicitud no la puedo procesar por este medio. Por favor contacta directamente
+al despacho (ANB Consultores)."
+No llames ninguna herramienta en ese caso.
 
 REGLAS DE SEGURIDAD:
-- No inventes datos fiscales.
+- No inventes datos fiscales ni claves de producto/servicio fuera del catálogo aprobado.
 - No des asesoría fiscal definitiva.
 - No prometas que la factura será timbrada.
 - No reveles información interna del despacho.
@@ -172,16 +166,21 @@ def build_file_content_block(file_bytes: bytes, media_type: str) -> dict:
 
 def run_conversation_turn(
     profile: ClientProfile,
+    catalogo: list[ClaveCatalogo],
     history: list,
     user_text: Optional[str] = None,
     file_bytes: Optional[bytes] = None,
     media_type: Optional[str] = None,
-) -> tuple[str, Optional[InvoiceData], Optional[RepData]]:
+) -> tuple[str, Optional[InvoiceDraft], Optional[RepDraft]]:
     """
     Run one turn of the conversation.
 
     Returns:
-        (client_message, invoice_data_or_None, rep_data_or_None)
+        (client_message, invoice_draft_or_None, rep_draft_or_None)
+
+    Nota: retorna DRAFTS (extracción sin montos), no InvoiceData/RepData ya
+    calculados. El cálculo fiscal ocurre en main.py vía fiscal_engine,
+    fuera de esta capa — ver fiscal_engine.py.
     """
     # Build user content
     if file_bytes and media_type:
@@ -196,16 +195,18 @@ def run_conversation_turn(
 
     system = [{
         "type": "text",
-        "text": build_system_prompt(profile),
+        "text": build_system_prompt(profile, catalogo),
         "cache_control": {"type": "ephemeral"},
     }]
+
+    tools = build_invoice_tools([c.clave_prod_serv for c in catalogo])
 
     for cycle in range(MAX_TOOL_CYCLES):
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=4096,
             system=system,
-            tools=CLAUDE_TOOLS,
+            tools=tools,
             messages=history,
         )
 
@@ -223,13 +224,13 @@ def run_conversation_turn(
                 ],
             })
 
-            if tool_name in ("generate_invoice_data", "generate_rep_data"):
+            if tool_name in ("generate_invoice_draft", "generate_rep_draft"):
                 # Validate before doing anything fiscal
                 try:
-                    if tool_name == "generate_invoice_data":
-                        result_data = InvoiceData(**tool_input)
+                    if tool_name == "generate_invoice_draft":
+                        result_data = InvoiceDraft(**tool_input)
                     else:
-                        result_data = RepData(**tool_input)
+                        result_data = RepDraft(**tool_input)
                 except ValidationError as e:
                     logger.warning("Validación de %s falló: %s", tool_name, e)
                     history.append({
@@ -265,7 +266,7 @@ def run_conversation_turn(
                     model=ANTHROPIC_MODEL,
                     max_tokens=1024,
                     system=system,
-                    tools=CLAUDE_TOOLS,
+                    tools=tools,
                     messages=history,
                 )
                 client_message = extract_text_from_response(final_response) or "Tu solicitud ha sido procesada."
@@ -276,7 +277,7 @@ def run_conversation_turn(
                         for b in final_response.content
                     ],
                 })
-                if isinstance(result_data, InvoiceData):
+                if isinstance(result_data, InvoiceDraft):
                     return client_message, result_data, None
                 else:
                     return client_message, None, result_data

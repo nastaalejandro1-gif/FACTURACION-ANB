@@ -1,3 +1,16 @@
+"""
+Tool schema de Claude — SOLO extracción y clasificación.
+
+Ningún campo aquí es un monto calculado (iva, retenciones, total): esos los
+produce fiscal_engine a partir de lo que Claude extrae. Ver models.py
+(InvoiceDraft/RepDraft) y fiscal_engine.py.
+
+clave_prod_serv está restringida a un enum dinámico armado con el catálogo
+aprobado del cliente (build_invoice_tools) — Claude no puede inventar una
+clave SAT fuera de esa lista; solo puede elegir "NUEVA" + proponer un
+código, que dispara escalamiento (EscalationReason.CLAVE_PROD_SERV_NUEVA).
+"""
+
 FORMAS_PAGO_ENUM = [
     "01", "02", "03", "04", "05", "06", "08",
     "12", "13", "17", "23", "24", "25", "26",
@@ -6,142 +19,148 @@ FORMAS_PAGO_ENUM = [
 
 FORMAS_PAGO_ENUM_REP = [f for f in FORMAS_PAGO_ENUM if f != "99"]
 
-CLAUDE_TOOLS = [
-    {
-        "name": "generate_invoice_data",
-        "description": (
-            "Genera los datos estructurados de la factura ÚNICAMENTE cuando el cliente "
-            "ha confirmado explícitamente todos los datos. No llamar antes de la confirmación."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "estatus": {
-                    "type": "string",
-                    "enum": ["confirmado_por_cliente"],
-                },
-                "requiere_revision": {"type": "boolean"},
-                "motivo_revision": {"type": "string", "default": ""},
-                "emisor": {
-                    "type": "object",
-                    "properties": {
-                        "nombre_comercial": {"type": "string"},
-                        "razon_social": {"type": "string"},
-                        "rfc": {"type": "string"},
-                        "regimen_fiscal": {"type": "string"},
-                        "cp_fiscal": {"type": "string"},
+CLAVE_NUEVA = "NUEVA"
+
+
+def build_invoice_tools(claves_catalogo: list[str]) -> list[dict]:
+    """
+    claves_catalogo: códigos clave_prod_serv aprobados para este cliente
+    (propios + globales del despacho, ver sheets_client.get_catalogo_claves).
+    Se arma en cada turno porque el catálogo puede crecer cuando ANB aprueba
+    una clave nueva.
+    """
+    claves_enum = list(dict.fromkeys([*claves_catalogo, CLAVE_NUEVA]))
+
+    return [
+        {
+            "name": "generate_invoice_draft",
+            "description": (
+                "Genera los datos EXTRAÍDOS de la factura ÚNICAMENTE cuando el cliente "
+                "ha confirmado explícitamente todos los datos. No calcules impuestos ni "
+                "totales — eso lo hace el sistema. No llamar antes de la confirmación."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "estatus": {
+                        "type": "string",
+                        "enum": ["confirmado_por_cliente"],
                     },
-                    "required": ["nombre_comercial", "razon_social", "rfc", "regimen_fiscal", "cp_fiscal"],
-                },
-                "receptor": {
-                    "type": "object",
-                    "properties": {
-                        "razon_social": {"type": "string"},
-                        "rfc": {"type": "string"},
-                        "regimen_fiscal": {"type": "string"},
-                        "cp_fiscal": {"type": "string"},
-                        "uso_cfdi": {"type": "string"},
+                    "receptor": {
+                        "type": "object",
+                        "properties": {
+                            "razon_social": {"type": "string"},
+                            "rfc": {"type": "string"},
+                            "regimen_fiscal": {"type": "string"},
+                            "cp_fiscal": {"type": "string"},
+                            "uso_cfdi": {"type": "string"},
+                        },
+                        "required": ["razon_social", "rfc", "regimen_fiscal", "cp_fiscal", "uso_cfdi"],
                     },
-                    "required": ["razon_social", "rfc", "regimen_fiscal", "cp_fiscal", "uso_cfdi"],
-                },
-                "factura": {
-                    "type": "object",
-                    "properties": {
-                        "conceptos": {
-                            "type": "array",
-                            "minItems": 1,
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "descripcion": {"type": "string"},
-                                    "clave_prod_serv": {"type": "string"},
-                                    "cantidad": {"type": "number"},
-                                    "clave_unidad": {
-                                        "type": "string",
-                                        "description": "Clave SAT: E48=Servicio, H87=Pieza, KGM=Kilogramo, LTR=Litro, MTR=Metro",
+                    "factura": {
+                        "type": "object",
+                        "properties": {
+                            "conceptos": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "descripcion": {"type": "string"},
+                                        "cantidad": {"type": "number"},
+                                        "clave_unidad": {
+                                            "type": "string",
+                                            "description": "Clave SAT: E48=Servicio, H87=Pieza, KGM=Kilogramo, LTR=Litro, MTR=Metro",
+                                        },
+                                        "precio_unitario": {
+                                            "type": "number",
+                                            "description": "Precio por unidad antes de impuestos.",
+                                        },
+                                        "clave_prod_serv": {
+                                            "type": "string",
+                                            "enum": claves_enum,
+                                            "description": (
+                                                "Elige la clave del catálogo aprobado que mejor describe "
+                                                "el concepto. Si ninguna aplica, usa 'NUEVA' y llena "
+                                                "clave_prod_serv_propuesta."
+                                            ),
+                                        },
+                                        "clave_prod_serv_propuesta": {
+                                            "type": "string",
+                                            "description": (
+                                                "Código SAT de 8 dígitos que propones — SOLO si "
+                                                "clave_prod_serv='NUEVA'. Se enviará a revisión del "
+                                                "despacho una sola vez."
+                                            ),
+                                        },
                                     },
-                                    "precio_unitario": {"type": "number"},
-                                    "ieps": {
-                                        "type": "number",
-                                        "description": "Monto de IEPS de este concepto. Solo para el producto gravado (ej. botana, papas). Para envío/flete y accesorios: 0.",
-                                    },
+                                    "required": ["descripcion", "cantidad", "clave_unidad", "precio_unitario", "clave_prod_serv"],
                                 },
-                                "required": ["descripcion", "clave_prod_serv", "cantidad", "clave_unidad", "precio_unitario"],
+                            },
+                            "metodo_pago": {"type": "string", "enum": ["PUE", "PPD"]},
+                            "forma_pago": {"type": "string", "enum": FORMAS_PAGO_ENUM},
+                            "observaciones": {"type": "string", "default": ""},
+                            "total_documento_fuente": {
+                                "type": "number",
+                                "description": (
+                                    "Total impreso en la cotización/documento fuente, si lo viste "
+                                    "explícitamente. Omite este campo si no hay documento o no "
+                                    "muestra un total."
+                                ),
                             },
                         },
-                        "monto_antes_impuestos": {
-                            "type": "number",
-                            "description": "Suma de cantidad * precio_unitario de todos los conceptos",
-                        },
-                        "ieps": {
-                            "type": "number",
-                            "description": "Suma del ieps de todos los conceptos. Debe coincidir con la suma de ieps por concepto.",
-                        },
-                        "iva": {"type": "number"},
-                        "retencion_iva": {"type": "number"},
-                        "retencion_isr": {"type": "number"},
-                        "total_estimado": {"type": "number"},
-                        "metodo_pago": {"type": "string", "enum": ["PUE", "PPD"]},
-                        "forma_pago": {"type": "string", "enum": FORMAS_PAGO_ENUM},
-                        "observaciones": {"type": "string", "default": ""},
+                        "required": ["conceptos", "metodo_pago", "forma_pago"],
                     },
-                    "required": [
-                        "conceptos", "monto_antes_impuestos",
-                        "iva", "retencion_iva", "retencion_isr", "total_estimado",
-                        "metodo_pago", "forma_pago",
-                    ],
                 },
+                "required": ["estatus", "receptor", "factura"],
             },
-            "required": ["estatus", "requiere_revision", "emisor", "receptor", "factura"],
         },
-    },
-    {
-        "name": "generate_rep_data",
-        "description": (
-            "Genera los datos del Recibo Electrónico de Pago (complemento de pago / REP) "
-            "ÚNICAMENTE cuando el cliente ha confirmado explícitamente todos los datos del pago. "
-            "Usar solo cuando el cliente reporta el pago de una factura PPD existente, "
-            "NO para facturas nuevas."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "estatus": {"type": "string", "enum": ["confirmado_por_cliente"]},
-                "uuid_factura_origen": {
-                    "type": "string",
-                    "description": "UUID / Folio Fiscal del CFDI PPD original. Formato: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
-                },
-                "receptor": {
-                    "type": "object",
-                    "properties": {
-                        "razon_social": {"type": "string"},
-                        "rfc": {"type": "string"},
-                        "regimen_fiscal": {"type": "string"},
-                        "cp_fiscal": {"type": "string"},
-                        "uso_cfdi": {"type": "string"},
+        {
+            "name": "generate_rep_draft",
+            "description": (
+                "Genera los datos EXTRAÍDOS del Recibo Electrónico de Pago (complemento de "
+                "pago / REP) ÚNICAMENTE cuando el cliente ha confirmado explícitamente todos "
+                "los datos del pago. No calcules el saldo insoluto — eso lo hace el sistema. "
+                "Usar solo cuando el cliente reporta el pago de una factura PPD existente, "
+                "NO para facturas nuevas."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "estatus": {"type": "string", "enum": ["confirmado_por_cliente"]},
+                    "uuid_factura_origen": {
+                        "type": "string",
+                        "description": "UUID / Folio Fiscal del CFDI PPD original. Formato: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
                     },
-                    "required": ["razon_social", "rfc", "regimen_fiscal", "cp_fiscal", "uso_cfdi"],
+                    "receptor": {
+                        "type": "object",
+                        "properties": {
+                            "razon_social": {"type": "string"},
+                            "rfc": {"type": "string"},
+                            "regimen_fiscal": {"type": "string"},
+                            "cp_fiscal": {"type": "string"},
+                            "uso_cfdi": {"type": "string"},
+                        },
+                        "required": ["razon_social", "rfc", "regimen_fiscal", "cp_fiscal", "uso_cfdi"],
+                    },
+                    "fecha_pago": {
+                        "type": "string",
+                        "description": "Fecha y hora del pago ISO 8601: YYYY-MM-DDTHH:MM:SS. Sin hora: usa T12:00:00.",
+                    },
+                    "forma_pago": {
+                        "type": "string",
+                        "enum": FORMAS_PAGO_ENUM_REP,
+                        "description": "Forma de pago real (no puede ser 99). 03=Transferencia, 04=Tarjeta crédito, 28=Tarjeta débito, 01=Efectivo.",
+                    },
+                    "monto_pagado": {
+                        "type": "number",
+                        "description": "Monto pagado en esta transacción.",
+                    },
                 },
-                "fecha_pago": {
-                    "type": "string",
-                    "description": "Fecha y hora del pago ISO 8601: YYYY-MM-DDTHH:MM:SS. Sin hora: usa T12:00:00.",
-                },
-                "forma_pago": {
-                    "type": "string",
-                    "enum": FORMAS_PAGO_ENUM_REP,
-                    "description": "Forma de pago real (no puede ser 99). 03=Transferencia, 04=Tarjeta crédito, 28=Tarjeta débito, 01=Efectivo.",
-                },
-                "monto_pagado": {
-                    "type": "number",
-                    "description": "Monto pagado en esta transacción.",
-                },
-                "requiere_revision": {"type": "boolean"},
-                "motivo_revision": {"type": "string", "default": ""},
+                "required": [
+                    "estatus", "uuid_factura_origen", "receptor",
+                    "fecha_pago", "forma_pago", "monto_pagado",
+                ],
             },
-            "required": [
-                "estatus", "uuid_factura_origen", "receptor",
-                "fecha_pago", "forma_pago", "monto_pagado", "requiere_revision",
-            ],
         },
-    },
-]
+    ]
