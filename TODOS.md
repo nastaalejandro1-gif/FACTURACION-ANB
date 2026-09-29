@@ -14,13 +14,41 @@
 - [x] **Migración a Supabase** — base de datos permanente, sin tokens que expiran, base para SaaS
 - [x] **Errores silenciosos corregidos** — crashes en background task ahora llegan por Telegram
 
-## Pendientes antes de lanzar con más clientes
+## Fase 4 — Restructure del motor fiscal (sep 2026) — COMPLETADA (código) ⚠️ falta probar en vivo
 
-- [ ] **REP — Recibo Electrónico de Pago (Complemento de Pago)** ← SIGUIENTE
-  Cuando una factura PPD se cobra, el cliente avisa al bot con la fecha y monto del pago.
-  El bot genera el complemento referenciando el UUID de la factura original.
-- [ ] **Pasar FacturAPI de sandbox a live** — cuando terminen las pruebas con el cliente actual
-- [ ] **Agregar los 15 clientes en Supabase** — tabla clientes, un row por cliente
+Plan completo en `.claude/plans/adaptive-forging-papert.md`. Principio: Claude extrae y
+clasifica, el código calcula (Decimal, tolerancia cero). Migrado a producción local
+(no pusheado a origin/main todavía — pendiente de pruebas manuales antes del push).
+
+- [x] `fiscal_engine.py` — motor de cálculo en Decimal, IEPS/IVA/retenciones/total,
+      redondeo ROUND_HALF_UP por concepto, REP con parcialidades.
+- [x] `escalation.py` — enum cerrado: clave nueva, validación aritmética/cruzada,
+      error de timbre, RFC inválido, receptor extranjero sin RFC. Reemplaza el
+      `requiere_revision` de libre interpretación de Claude.
+- [x] Catálogo de `clave_prod_serv` por cliente en Supabase (`catalogo_clave_prod_serv`) +
+      reglas fiscales versionadas (`reglas_fiscales_cliente`) — migrados los 2 clientes
+      actuales (Envoy, Sin Culpa) desde `clientes`.
+- [x] Aprobación del cliente con botones Sí/No auditables antes de timbrar (ya no hay
+      auto-timbre directo) — con chequeo de seguridad de que un cliente no pueda
+      aprobar la factura de otro.
+- [x] REP con sobrepago → escala en vez de recortar el saldo a 0 (ver ítem de auditoría abajo).
+- [x] Tasas de impuesto exactas transportadas a FacturAPI (ya no se recalculan por división).
+- [ ] **Probar contra Claude real** — todo lo de arriba se probó con tests unitarios y
+      mocks; falta correr conversaciones reales (CSF + cotización) contra el sandbox de
+      Anthropic y comparar el resultado calculado contra lo que se timbraba antes.
+- [ ] **Verificar redondeo contra el Anexo 20** con 2-3 casos timbrados en sandbox de
+      FacturAPI, comparados centavo a centavo (la regla ROUND_HALF_UP por concepto está
+      implementada pero no verificada contra un timbrado real).
+- [ ] **Revisar `aplica_ieps` de claves nuevas aprobadas** — hoy el botón "Aprobar" de
+      ANB siempre guarda `aplica_ieps=False` por default (más seguro que sobre-cobrar);
+      si una clave nueva SÍ lleva IEPS, hay que corregirlo a mano en Supabase después de
+      aprobar.
+- [ ] **Push a origin/main + deploy** — todo el restructure está en 8 commits locales,
+      nada pusheado todavía. Requiere confirmación explícita antes de hacer push (el bot
+      está en producción con clientes reales).
+- [ ] Pasar FacturAPI de sandbox a live — cuando terminen las pruebas del restructure
+- [ ] Agregar los 13 clientes restantes en Supabase (clientes + reglas_fiscales_cliente +
+      catalogo_clave_prod_serv) — hoy solo Envoy y Sin Culpa están migrados
 
 ## Fase 3
 
@@ -31,7 +59,7 @@
 ## Pendientes de la auditoría (jun 2026) — antes de crecer
 
 - [ ] Deduplicar updates de Telegram por update_id (hoy un update reentregado puede duplicar una factura de auto-timbre)
-- [ ] REP con sobrepago → requiere_revision en vez de recortar el saldo a 0
+- [x] REP con sobrepago → escala (VALIDACION_ARITMETICA) en vez de recortar el saldo a 0 — hecho en Fase 4
 - [ ] Cron /check-pending: marcar notificado o mandar un solo resumen (hoy re-notifica todo en cada corrida)
 - [ ] Claude tool use paralelo: responder todos los tool_use o usar disable_parallel_tool_use
 - [ ] Índices en Supabase (correr en SQL Editor):
