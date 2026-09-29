@@ -1,12 +1,15 @@
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 from typing import Optional
 
 from supabase import create_client, Client
 
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, DESPACHO_ID
+from fiscal_engine import FiscalRules
 from models import ClientProfile
 
 logger = logging.getLogger(__name__)
@@ -208,22 +211,34 @@ def save_pending(
     telegram_message_id: int,
     invoice_json: str,
     motivo_revision: str,
+    tipo_aprobacion: str = "anb_revision",
+    canal_id_aprobador: Optional[str] = None,
 ) -> None:
+    """
+    tipo_aprobacion: 'anb_revision' (default, escalamiento a ANB) o
+    'cliente_confirmacion' (vista previa con botones Sí/No para el cliente).
+    canal_id_aprobador: quién está autorizado a pulsar el botón — obligatorio
+    para 'cliente_confirmacion' (ver main.py::handle_callback_query, que
+    verifica esto antes de timbrar para que un cliente no apruebe la
+    factura de otro).
+    """
     sb = _get_supabase()
     now = datetime.now(timezone.utc).isoformat()
-    sb.table("pendientes").insert(
-        {
-            "id": invoice_id,
-            "despacho_id": DESPACHO_ID,
-            "canal": canal,
-            "canal_id": canal_id,
-            "telegram_message_id": telegram_message_id,
-            "invoice_json": invoice_json,
-            "motivo_revision": motivo_revision,
-            "timestamp": now,
-            "estado": "pendiente",
-        }
-    ).execute()
+    row = {
+        "id": invoice_id,
+        "despacho_id": DESPACHO_ID,
+        "canal": canal,
+        "canal_id": canal_id,
+        "telegram_message_id": telegram_message_id,
+        "invoice_json": invoice_json,
+        "motivo_revision": motivo_revision,
+        "timestamp": now,
+        "estado": "pendiente",
+        "tipo_aprobacion": tipo_aprobacion,
+    }
+    if canal_id_aprobador is not None:
+        row["canal_id_aprobador"] = canal_id_aprobador
+    sb.table("pendientes").insert(row).execute()
 
 
 def get_pending(invoice_id: str) -> Optional[dict]:
@@ -328,3 +343,104 @@ def log_to_bitacora(
     if imp_saldo_insoluto is not None:
         row["imp_saldo_insoluto"] = imp_saldo_insoluto
     sb.table("bitacora").upsert(row, on_conflict="id").execute()
+
+
+# ---------------------------------------------------------------------------
+# Catálogo de clave_prod_serv y reglas fiscales (motor de cálculo)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ClaveCatalogo:
+    clave_prod_serv: str
+    descripcion_clave: str
+    aplica_ieps: bool
+    id_cliente: Optional[str]  # None = clave global del despacho
+
+
+def get_catalogo_claves(despacho_id: str, id_cliente: str) -> list[ClaveCatalogo]:
+    """Claves aprobadas para este cliente + las globales del despacho (ej. flete)."""
+    sb = _get_supabase()
+    propias = (
+        sb.table("catalogo_clave_prod_serv")
+        .select("*")
+        .eq("despacho_id", despacho_id)
+        .eq("id_cliente", id_cliente)
+        .eq("activa", True)
+        .execute()
+    ).data or []
+    globales = (
+        sb.table("catalogo_clave_prod_serv")
+        .select("*")
+        .eq("despacho_id", despacho_id)
+        .is_("id_cliente", "null")
+        .eq("activa", True)
+        .execute()
+    ).data or []
+    return [
+        ClaveCatalogo(
+            clave_prod_serv=str(f["clave_prod_serv"]),
+            descripcion_clave=str(f["descripcion_clave"]),
+            aplica_ieps=bool(f["aplica_ieps"]),
+            id_cliente=f.get("id_cliente"),
+        )
+        for f in (propias + globales)
+    ]
+
+
+def save_clave_aprobada(
+    despacho_id: str,
+    id_cliente: str,
+    clave_prod_serv: str,
+    descripcion_clave: str,
+    aplica_ieps: bool,
+    aprobada_por: str,
+) -> None:
+    """Agrega (o reactiva) una clave al catálogo del cliente — se llama cuando
+    ANB aprueba una clave escalada por EscalationReason.CLAVE_PROD_SERV_NUEVA.
+    Idempotente vía upsert sobre el UNIQUE (despacho_id, id_cliente, clave_prod_serv)."""
+    sb = _get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("catalogo_clave_prod_serv").upsert(
+        {
+            "despacho_id": despacho_id,
+            "id_cliente": id_cliente,
+            "clave_prod_serv": clave_prod_serv,
+            "descripcion_clave": descripcion_clave,
+            "aplica_ieps": aplica_ieps,
+            "aprobada_por": aprobada_por,
+            "fecha_aprobacion": now,
+            "activa": True,
+        },
+        on_conflict="despacho_id,id_cliente,clave_prod_serv",
+    ).execute()
+
+
+def get_fiscal_rules(despacho_id: str, id_cliente: str) -> FiscalRules:
+    """Trae la regla fiscal vigente (vigente_hasta IS NULL) y el catálogo de
+    claves del cliente, y arma el FiscalRules que espera fiscal_engine."""
+    sb = _get_supabase()
+    result = (
+        sb.table("reglas_fiscales_cliente")
+        .select("*")
+        .eq("despacho_id", despacho_id)
+        .eq("id_cliente", id_cliente)
+        .is_("vigente_hasta", "null")
+        .order("vigente_desde", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        raise ValueError(f"No hay reglas fiscales vigentes para el cliente {id_cliente}")
+    row = result.data[0]
+
+    claves = get_catalogo_claves(despacho_id, id_cliente)
+    claves_con_ieps = frozenset(c.clave_prod_serv for c in claves if c.aplica_ieps)
+
+    return FiscalRules(
+        iva_aplica=bool(row["iva_aplica"]),
+        tasa_iva=Decimal(str(row["tasa_iva"])),
+        retencion_iva_tasa=Decimal(str(row["retencion_iva_tasa"])),
+        retencion_isr_tasa=Decimal(str(row["retencion_isr_tasa"])),
+        ieps_tasa=Decimal(str(row["ieps_tasa"])),
+        claves_con_ieps=claves_con_ieps,
+    )
