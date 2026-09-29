@@ -254,3 +254,64 @@ def test_fiscal_calculation_result_exige_exactamente_uno():
     from fiscal_engine import FiscalCalculationResult
     with pytest.raises(ValueError):
         FiscalCalculationResult(factura=None, escalation=None)
+
+
+def test_iva_se_calcula_por_concepto_no_sobre_el_agregado():
+    """
+    Caso real que expuso el bug (auditoría con sandbox real, PM + IEPS +
+    retenciones + 3 conceptos): calcular IVA una sola vez sobre
+    (subtotal+ieps) daba $308.63, pero FacturAPI — que calcula y redondea
+    el IVA de cada concepto por separado y suma — daba $308.62. La
+    diferencia de un centavo es exactamente lo que "tolerancia cero"
+    prohíbe. El motor debe calcular IVA por concepto igual que el IEPS.
+    """
+    reglas = FiscalRules(
+        iva_aplica=True, tasa_iva=Decimal("0.16"),
+        retencion_iva_tasa=Decimal("0.1067"), retencion_isr_tasa=Decimal("0.0125"),
+        ieps_tasa=Decimal("0.08"), claves_con_ieps=frozenset({"50192100"}),
+    )
+    conceptos = [
+        ConceptoExtraido(descripcion="Botana gravada A", cantidad=Decimal("15"),
+            precio_unitario=Decimal("37.25"), clave_unidad="H87", clave_prod_serv="50192100"),
+        ConceptoExtraido(descripcion="Botana gravada B", cantidad=Decimal("8"),
+            precio_unitario=Decimal("112.90"), clave_unidad="H87", clave_prod_serv="50192100"),
+        ConceptoExtraido(descripcion="Flete", cantidad=Decimal("1"),
+            precio_unitario=Decimal("350.00"), clave_unidad="E48", clave_prod_serv="78101800"),
+    ]
+    resultado = calcular_factura(conceptos, RECEPTOR_PM, reglas, "PPD", "99")
+    assert resultado.escalation is None
+    f = resultado.factura
+    assert f.subtotal == Decimal("1811.95")
+    assert f.ieps == Decimal("116.96")
+    # 308.62 (por concepto), NO 308.63 (agregado) -- esto es lo que verificó
+    # el timbrado real contra FacturAPI.
+    assert f.iva == Decimal("308.62")
+    assert f.retencion_iva == Decimal("32.93")
+    assert f.retencion_isr == Decimal("22.65")
+    assert f.total == Decimal("2181.95")
+
+
+def test_iva_por_concepto_reconstruye_suma_de_lineas_individuales():
+    """Verifica explícitamente que el iva agregado == suma de iva por línea,
+    calculando cada línea por separado con la misma fórmula que usa el motor."""
+    reglas = FiscalRules(
+        iva_aplica=True, tasa_iva=Decimal("0.16"),
+        retencion_iva_tasa=Decimal("0"), retencion_isr_tasa=Decimal("0"),
+        ieps_tasa=Decimal("0"), claves_con_ieps=frozenset(),
+    )
+    conceptos = [
+        ConceptoExtraido(descripcion="A", cantidad=Decimal("15"), precio_unitario=Decimal("37.25"),
+            clave_unidad="H87", clave_prod_serv="X"),
+        ConceptoExtraido(descripcion="B", cantidad=Decimal("8"), precio_unitario=Decimal("112.90"),
+            clave_unidad="H87", clave_prod_serv="X"),
+        ConceptoExtraido(descripcion="C", cantidad=Decimal("1"), precio_unitario=Decimal("350.00"),
+            clave_unidad="E48", clave_prod_serv="X"),
+    ]
+    resultado = calcular_factura(conceptos, RECEPTOR_PM, reglas, "PUE", "03")
+    f = resultado.factura
+    iva_por_linea = [
+        (Decimal("15") * Decimal("37.25") * Decimal("0.16")).quantize(Decimal("0.01")),
+        (Decimal("8") * Decimal("112.90") * Decimal("0.16")).quantize(Decimal("0.01")),
+        (Decimal("1") * Decimal("350.00") * Decimal("0.16")).quantize(Decimal("0.01")),
+    ]
+    assert f.iva == sum(iva_por_linea, Decimal("0"))

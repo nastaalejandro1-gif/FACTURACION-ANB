@@ -157,12 +157,24 @@ def calcular_factura(
             ),
         ))
 
+    # tasa_iva se necesita ANTES del loop: el IVA se calcula POR CONCEPTO
+    # (igual que el IEPS), no una sola vez sobre el agregado — FacturAPI/SAT
+    # calculan y redondean el impuesto de cada línea del CFDI por separado
+    # y suman; redondear una sola vez sobre (subtotal+ieps) puede diferir
+    # en un centavo de esa suma cuando hay 2+ conceptos (redondeo no es
+    # distributivo). Confirmado con un timbrado real: agregado daba
+    # iva=308.63, FacturAPI (por línea) daba 308.62.
+    tasa_iva = reglas.tasa_iva if reglas.iva_aplica else Decimal("0")
+
     conceptos_calculados: list[ConceptoCalculado] = []
+    iva_total = Decimal("0.00")
     for c in conceptos:
         importe = _redondear(c.cantidad * c.precio_unitario)
         aplica_ieps = c.clave_prod_serv in reglas.claves_con_ieps
         ieps_tasa_concepto = reglas.ieps_tasa if aplica_ieps else Decimal("0")
         ieps_concepto = _redondear(importe * ieps_tasa_concepto) if aplica_ieps else Decimal("0.00")
+        iva_concepto = _redondear((importe + ieps_concepto) * tasa_iva)
+        iva_total += iva_concepto
         conceptos_calculados.append(ConceptoCalculado(
             descripcion=c.descripcion,
             clave_prod_serv=c.clave_prod_serv,
@@ -176,6 +188,7 @@ def calcular_factura(
 
     subtotal = sum((cc.importe for cc in conceptos_calculados), Decimal("0.00"))
     ieps_total = sum((cc.ieps for cc in conceptos_calculados), Decimal("0.00"))
+    iva = iva_total
 
     if not omitir_validacion_cruzada and total_documento_fuente is not None and abs(subtotal - total_documento_fuente) > CENTAVO:
         return FiscalCalculationResult(escalation=EscalationDetail(
@@ -185,9 +198,6 @@ def calcular_factura(
                 f"con la suma de los conceptos extraídos (${subtotal})."
             ),
         ))
-
-    tasa_iva = reglas.tasa_iva if reglas.iva_aplica else Decimal("0")
-    iva = _redondear((subtotal + ieps_total) * tasa_iva)
 
     if tipo_persona == "PM":
         retencion_iva_tasa = reglas.retencion_iva_tasa
