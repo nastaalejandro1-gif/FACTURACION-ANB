@@ -54,6 +54,10 @@ class FiscalRules:
     retencion_isr_tasa: Decimal
     ieps_tasa: Decimal
     claves_con_ieps: frozenset[str]  # claves del catalogo_clave_prod_serv con aplica_ieps=True
+    # Facturas por encima de esto -> EscalationReason.MONTO_ALTO. Default
+    # solo para no romper construcciones existentes (tests, etc.) — el
+    # valor real siempre viene de reglas_fiscales_cliente.
+    monto_maximo_sin_autorizacion: Decimal = Decimal("100000")
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +216,19 @@ def calcular_factura(
         retencion_isr = Decimal("0.00")
 
     total = subtotal + ieps_total + iva - retencion_iva - retencion_isr
+
+    # Decisión de negocio de ANB (no fiscal): facturas por encima de un
+    # monto requieren su autorización antes de pasar a confirmación del
+    # cliente. omitir_validacion_cruzada=True también salta esto — es la
+    # misma señal de "ANB ya lo revisó y aprobó, seguir adelante".
+    if not omitir_validacion_cruzada and total > reglas.monto_maximo_sin_autorizacion:
+        return FiscalCalculationResult(escalation=EscalationDetail(
+            reason=EscalationReason.MONTO_ALTO,
+            detail=(
+                f"El total de la factura (${total}) supera el máximo sin autorización "
+                f"(${reglas.monto_maximo_sin_autorizacion})."
+            ),
+        ))
 
     # Regla SAT: PPD siempre forma_pago=99. Se normaliza, no se confía en
     # lo que haya extraído Claude del mensaje del cliente.

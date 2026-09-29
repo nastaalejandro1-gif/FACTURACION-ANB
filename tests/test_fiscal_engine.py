@@ -315,3 +315,59 @@ def test_iva_por_concepto_reconstruye_suma_de_lineas_individuales():
         (Decimal("1") * Decimal("350.00") * Decimal("0.16")).quantize(Decimal("0.01")),
     ]
     assert f.iva == sum(iva_por_linea, Decimal("0"))
+
+
+# ---------------------------------------------------------------------------
+# Monto alto -> requiere autorización de ANB (decisión de negocio, no fiscal)
+# ---------------------------------------------------------------------------
+
+def test_factura_por_encima_del_maximo_escala_monto_alto():
+    reglas = FiscalRules(
+        iva_aplica=True, tasa_iva=Decimal("0.16"),
+        retencion_iva_tasa=Decimal("0"), retencion_isr_tasa=Decimal("0"),
+        ieps_tasa=Decimal("0"), claves_con_ieps=frozenset(),
+        monto_maximo_sin_autorizacion=Decimal("100000"),
+    )
+    conceptos = [ConceptoExtraido(
+        descripcion="Servicio", cantidad=Decimal("1"),
+        precio_unitario=Decimal("100000.00"), clave_unidad="E48", clave_prod_serv="78101803",
+    )]
+    resultado = calcular_factura(conceptos, RECEPTOR_PF, reglas, "PUE", "03")
+    assert resultado.factura is None
+    assert resultado.escalation.reason == EscalationReason.MONTO_ALTO
+
+
+def test_factura_justo_en_el_limite_no_escala():
+    reglas = FiscalRules(
+        iva_aplica=False, tasa_iva=Decimal("0"),
+        retencion_iva_tasa=Decimal("0"), retencion_isr_tasa=Decimal("0"),
+        ieps_tasa=Decimal("0"), claves_con_ieps=frozenset(),
+        monto_maximo_sin_autorizacion=Decimal("100000"),
+    )
+    conceptos = [ConceptoExtraido(
+        descripcion="Servicio", cantidad=Decimal("1"),
+        precio_unitario=Decimal("100000.00"), clave_unidad="E48", clave_prod_serv="78101803",
+    )]
+    resultado = calcular_factura(conceptos, RECEPTOR_PF, reglas, "PUE", "03")
+    assert resultado.escalation is None
+    assert resultado.factura.total == Decimal("100000.00")
+
+
+def test_omitir_validacion_cruzada_tambien_permite_pasar_monto_alto():
+    """ANB ya aprobó la factura de monto alto -- el reintento no debe volver
+    a escalar por el mismo motivo."""
+    reglas = FiscalRules(
+        iva_aplica=True, tasa_iva=Decimal("0.16"),
+        retencion_iva_tasa=Decimal("0"), retencion_isr_tasa=Decimal("0"),
+        ieps_tasa=Decimal("0"), claves_con_ieps=frozenset(),
+        monto_maximo_sin_autorizacion=Decimal("100000"),
+    )
+    conceptos = [ConceptoExtraido(
+        descripcion="Servicio", cantidad=Decimal("1"),
+        precio_unitario=Decimal("200000.00"), clave_unidad="E48", clave_prod_serv="78101803",
+    )]
+    resultado = calcular_factura(
+        conceptos, RECEPTOR_PF, reglas, "PUE", "03", omitir_validacion_cruzada=True,
+    )
+    assert resultado.escalation is None
+    assert resultado.factura.total == Decimal("232000.00")

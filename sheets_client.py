@@ -446,4 +446,5 @@ def get_fiscal_rules(despacho_id: str, id_cliente: str) -> FiscalRules:
         retencion_isr_tasa=Decimal(str(row["retencion_isr_tasa"])),
         ieps_tasa=Decimal(str(row["ieps_tasa"])),
         claves_con_ieps=claves_con_ieps,
+        monto_maximo_sin_autorizacion=Decimal(str(row.get("monto_maximo_sin_autorizacion") or "100000")),
     )

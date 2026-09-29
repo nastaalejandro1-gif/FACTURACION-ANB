@@ -16,6 +16,7 @@ class EscalationReason(str, Enum):
     ERROR_TIMBRE_SAT = "error_timbre_sat"
     RFC_INVALIDO = "rfc_invalido"
     RECEPTOR_EXTRANJERO_SIN_RFC = "receptor_extranjero_sin_rfc"
+    MONTO_ALTO = "monto_alto"  # decisión de negocio de ANB, no fiscal — ver reglas_fiscales_cliente.monto_maximo_sin_autorizacion
 
 
 @dataclass(frozen=True)
