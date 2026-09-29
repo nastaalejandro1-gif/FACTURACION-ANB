@@ -1,4 +1,5 @@
 import logging
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
 import httpx
@@ -49,6 +50,8 @@ def _build_facturapi_payload(data: InvoiceData) -> dict:
     Decimal para precisión exacta; FacturAPI recibe JSON estándar (httpx no
     sabe serializar Decimal). La conversión a float ocurre SOLO aquí.
     """
+    retenciones = _calcular_tasas_retencion_efectivas(data)
+
     items = [
         {
             "quantity": float(concepto.cantidad),
@@ -58,7 +61,7 @@ def _build_facturapi_payload(data: InvoiceData) -> dict:
                 "price": float(concepto.precio_unitario),
                 "tax_included": False,
                 "unit_key": concepto.clave_unidad,
-                "taxes": _build_taxes_for_concepto(concepto, data),
+                "taxes": _build_taxes_for_concepto(concepto, data, retenciones),
             },
         }
         for concepto in data.factura.conceptos
@@ -81,13 +84,49 @@ def _build_facturapi_payload(data: InvoiceData) -> dict:
     }
 
 
-def _build_taxes_for_concepto(concepto, data: InvoiceData) -> list:
-    # Tasas EXACTAS transportadas desde fiscal_engine/reglas_fiscales_cliente
-    # (concepto.ieps_tasa, data.factura.tasa_iva/retencion_*_tasa) — nunca
-    # recalculadas dividiendo un monto ya redondeado entre su base, que
-    # arrastra error de redondeo.
+def _calcular_tasas_retencion_efectivas(data: InvoiceData) -> tuple[Decimal, Decimal]:
+    """
+    FacturAPI calcula cada impuesto de una línea como `rate * base`, donde
+    `base` es SIEMPRE el precio del concepto MÁS cualquier IEPS ya
+    trasladado en esa misma línea (confirmado empíricamente contra el
+    sandbox: un concepto con IEPS usa base = importe + ieps para el IVA Y
+    para las retenciones de esa línea, no solo para el IVA).
+
+    Pero `factura.retencion_iva`/`retencion_isr` (ver fiscal_engine.py) se
+    calculan contra bases DISTINTAS: retencion_iva = iva_total * tasa
+    (fórmula validada por el despacho — ver el fixture histórico de
+    test_critical.py, retencion_iva=85.36 para iva=800.00 = 800*0.1067),
+    y retencion_isr = subtotal SIN ieps * tasa. Ninguna de las dos
+    coincide con la base que usa FacturAPI.
+
+    Por eso NO se manda la tasa "semántica" (data.factura.retencion_*_tasa)
+    directo a FacturAPI — se back-calcula la tasa EFECTIVA que, aplicada a
+    la base real que usará FacturAPI (suma de precio+ieps de todos los
+    conceptos), reproduce EXACTO el monto ya calculado por fiscal_engine.
+    Es el mismo mecanismo que ya usaba este archivo antes del restructure;
+    aquí se hace con Decimal en vez de float, y con la base correcta
+    (incluye IEPS) en vez de solo el subtotal.
+    """
+    base_efectiva_total = data.factura.monto_antes_impuestos + data.factura.ieps
+
+    def _tasa_efectiva(monto: Decimal) -> Decimal:
+        if monto <= 0:
+            return Decimal("0")
+        return (monto / base_efectiva_total).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+    return (
+        _tasa_efectiva(data.factura.retencion_iva),
+        _tasa_efectiva(data.factura.retencion_isr),
+    )
+
+
+def _build_taxes_for_concepto(concepto, data: InvoiceData, retenciones: tuple[Decimal, Decimal]) -> list:
+    retencion_iva_rate, retencion_isr_rate = retenciones
     taxes = []
 
+    # IEPS e IVA: la tasa que fiscal_engine calculó SÍ coincide con la base
+    # que usa FacturAPI (precio del concepto, y precio+ieps respectivamente)
+    # — se mandan exactas, sin back-calcular.
     if concepto.ieps > 0:
         taxes.append({
             "type": "IEPS",
@@ -107,7 +146,7 @@ def _build_taxes_for_concepto(concepto, data: InvoiceData) -> list:
     if data.factura.retencion_iva > 0:
         taxes.append({
             "type": "IVA",
-            "rate": float(data.factura.retencion_iva_tasa),
+            "rate": float(retencion_iva_rate),
             "factor": "Tasa",
             "withholding": True,
         })
@@ -115,7 +154,7 @@ def _build_taxes_for_concepto(concepto, data: InvoiceData) -> list:
     if data.factura.retencion_isr > 0:
         taxes.append({
             "type": "ISR",
-            "rate": float(data.factura.retencion_isr_tasa),
+            "rate": float(retencion_isr_rate),
             "factor": "Tasa",
             "withholding": True,
         })
