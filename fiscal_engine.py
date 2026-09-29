@@ -1,0 +1,237 @@
+"""
+Motor de cálculo fiscal — Claude extrae y clasifica, este módulo calcula.
+
+Puro: sin red, sin `anthropic`, sin `httpx`, sin `supabase`. Solo `decimal`,
+tipos de `models` para las firmas de entrada, y `sat_catalogs`/`escalation`.
+
+Ningún monto fiscal (IEPS, IVA, retenciones, total) debe originarse fuera
+de este módulo. Todos los montos de entrada/salida son `Decimal`; la
+conversión a `float` ocurre solo en la frontera hacia FacturAPI/Supabase,
+nunca aquí.
+
+Redondeo: ROUND_HALF_UP a centavo, POR CONCEPTO (no al final) — así
+`Σ importes == subtotal` por construcción, igual que hace FacturAPI/el SAT.
+Ver Anexo_20_Guia_de_llenado_CFDI 4.0.pdf en la raíz del repo para
+confirmar la regla exacta contra 2 casos timbrados en sandbox antes de
+depender de esto para clientes reales.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Optional
+
+from escalation import EscalationDetail, EscalationReason
+from models import ReceptorData
+from sat_catalogs import regimen_coincide_con_tipo_persona, tipo_persona_from_rfc
+
+CENTAVO = Decimal("0.01")
+
+
+def _redondear(valor: Decimal) -> Decimal:
+    return valor.quantize(CENTAVO, rounding=ROUND_HALF_UP)
+
+
+# ---------------------------------------------------------------------------
+# Entrada (lo que Claude extrae del documento/chat)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ConceptoExtraido:
+    descripcion: str
+    cantidad: Decimal
+    precio_unitario: Decimal
+    clave_unidad: str
+    clave_prod_serv: str
+
+
+@dataclass(frozen=True)
+class FiscalRules:
+    """Cargado desde la tabla reglas_fiscales_cliente (ver sheets_client.get_fiscal_rules)."""
+    iva_aplica: bool
+    tasa_iva: Decimal
+    retencion_iva_tasa: Decimal
+    retencion_isr_tasa: Decimal
+    ieps_tasa: Decimal
+    claves_con_ieps: frozenset[str]  # claves del catalogo_clave_prod_serv con aplica_ieps=True
+
+
+# ---------------------------------------------------------------------------
+# Salida (lo que se timbra)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ConceptoCalculado:
+    descripcion: str
+    clave_prod_serv: str
+    clave_unidad: str
+    cantidad: Decimal
+    precio_unitario: Decimal
+    importe: Decimal
+    ieps: Decimal
+
+
+@dataclass(frozen=True)
+class FacturaCalculada:
+    conceptos: list[ConceptoCalculado]
+    subtotal: Decimal
+    ieps: Decimal
+    iva: Decimal
+    tasa_iva: Decimal
+    retencion_iva: Decimal
+    retencion_iva_tasa: Decimal
+    retencion_isr: Decimal
+    retencion_isr_tasa: Decimal
+    total: Decimal
+    metodo_pago: str
+    forma_pago: str
+    tipo_persona_receptor: str
+
+
+@dataclass(frozen=True)
+class FiscalCalculationResult:
+    factura: Optional[FacturaCalculada] = None
+    escalation: Optional[EscalationDetail] = None
+
+    def __post_init__(self) -> None:
+        if (self.factura is None) == (self.escalation is None):
+            raise ValueError(
+                "FiscalCalculationResult debe traer exactamente uno de: factura, escalation"
+            )
+
+
+@dataclass(frozen=True)
+class RepCalculado:
+    monto_pagado: Decimal
+    imp_saldo_ant: Decimal
+    imp_saldo_insoluto: Decimal
+
+
+@dataclass(frozen=True)
+class RepCalculationResult:
+    rep: Optional[RepCalculado] = None
+    escalation: Optional[EscalationDetail] = None
+
+    def __post_init__(self) -> None:
+        if (self.rep is None) == (self.escalation is None):
+            raise ValueError(
+                "RepCalculationResult debe traer exactamente uno de: rep, escalation"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Cálculo — factura de ingreso
+# ---------------------------------------------------------------------------
+
+def calcular_factura(
+    conceptos: list[ConceptoExtraido],
+    receptor: ReceptorData,
+    reglas: FiscalRules,
+    metodo_pago: str,
+    forma_pago: str,
+    total_documento_fuente: Optional[Decimal] = None,
+) -> FiscalCalculationResult:
+    if not conceptos:
+        raise ValueError("calcular_factura requiere al menos un concepto")
+
+    # Validación cruzada determinista RFC <-> régimen fiscal (ver sat_catalogs).
+    # No es "duda fiscal" del prompt: es el motor detectando una inconsistencia
+    # de datos real, mapeada a VALIDACION_ARITMETICA (validación cruzada).
+    tipo_persona = tipo_persona_from_rfc(receptor.rfc)
+    if not regimen_coincide_con_tipo_persona(receptor.regimen_fiscal, tipo_persona):
+        return FiscalCalculationResult(escalation=EscalationDetail(
+            reason=EscalationReason.VALIDACION_ARITMETICA,
+            detail=(
+                f"El régimen fiscal {receptor.regimen_fiscal} del receptor no corresponde "
+                f"al tipo de persona {tipo_persona} (derivado del RFC {receptor.rfc})."
+            ),
+        ))
+
+    conceptos_calculados: list[ConceptoCalculado] = []
+    for c in conceptos:
+        importe = _redondear(c.cantidad * c.precio_unitario)
+        aplica_ieps = c.clave_prod_serv in reglas.claves_con_ieps
+        ieps_concepto = _redondear(importe * reglas.ieps_tasa) if aplica_ieps else Decimal("0.00")
+        conceptos_calculados.append(ConceptoCalculado(
+            descripcion=c.descripcion,
+            clave_prod_serv=c.clave_prod_serv,
+            clave_unidad=c.clave_unidad,
+            cantidad=c.cantidad,
+            precio_unitario=c.precio_unitario,
+            importe=importe,
+            ieps=ieps_concepto,
+        ))
+
+    subtotal = sum((cc.importe for cc in conceptos_calculados), Decimal("0.00"))
+    ieps_total = sum((cc.ieps for cc in conceptos_calculados), Decimal("0.00"))
+
+    if total_documento_fuente is not None and abs(subtotal - total_documento_fuente) > CENTAVO:
+        return FiscalCalculationResult(escalation=EscalationDetail(
+            reason=EscalationReason.VALIDACION_ARITMETICA,
+            detail=(
+                f"El total del documento fuente (${total_documento_fuente}) no coincide "
+                f"con la suma de los conceptos extraídos (${subtotal})."
+            ),
+        ))
+
+    tasa_iva = reglas.tasa_iva if reglas.iva_aplica else Decimal("0")
+    iva = _redondear((subtotal + ieps_total) * tasa_iva)
+
+    if tipo_persona == "PM":
+        retencion_iva_tasa = reglas.retencion_iva_tasa
+        retencion_isr_tasa = reglas.retencion_isr_tasa
+        retencion_iva = _redondear(iva * retencion_iva_tasa)
+        retencion_isr = _redondear(subtotal * retencion_isr_tasa)
+    else:
+        # Receptor PF: retenciones siempre en 0, sin excepción.
+        retencion_iva_tasa = Decimal("0")
+        retencion_isr_tasa = Decimal("0")
+        retencion_iva = Decimal("0.00")
+        retencion_isr = Decimal("0.00")
+
+    total = subtotal + ieps_total + iva - retencion_iva - retencion_isr
+
+    # Regla SAT: PPD siempre forma_pago=99. Se normaliza, no se confía en
+    # lo que haya extraído Claude del mensaje del cliente.
+    forma_pago_final = "99" if metodo_pago == "PPD" else forma_pago
+
+    factura = FacturaCalculada(
+        conceptos=conceptos_calculados,
+        subtotal=subtotal,
+        ieps=ieps_total,
+        iva=iva,
+        tasa_iva=tasa_iva,
+        retencion_iva=retencion_iva,
+        retencion_iva_tasa=retencion_iva_tasa,
+        retencion_isr=retencion_isr,
+        retencion_isr_tasa=retencion_isr_tasa,
+        total=total,
+        metodo_pago=metodo_pago,
+        forma_pago=forma_pago_final,
+        tipo_persona_receptor=tipo_persona,
+    )
+    return FiscalCalculationResult(factura=factura)
+
+
+# ---------------------------------------------------------------------------
+# Cálculo — REP (complemento de pago)
+# ---------------------------------------------------------------------------
+
+def calcular_rep(monto_pagado: Decimal, imp_saldo_ant: Decimal) -> RepCalculationResult:
+    if monto_pagado > imp_saldo_ant:
+        # Antes se recortaba el saldo a 0 silenciosamente (bug conocido, ver
+        # TODOS.md). Un sobrepago es un dato que no cuadra: se escala.
+        return RepCalculationResult(escalation=EscalationDetail(
+            reason=EscalationReason.VALIDACION_ARITMETICA,
+            detail=(
+                f"El monto pagado (${monto_pagado}) excede el saldo insoluto anterior "
+                f"(${imp_saldo_ant}). Posible sobrepago o error de captura."
+            ),
+        ))
+
+    imp_saldo_insoluto = _redondear(imp_saldo_ant - monto_pagado)
+    return RepCalculationResult(rep=RepCalculado(
+        monto_pagado=monto_pagado,
+        imp_saldo_ant=imp_saldo_ant,
+        imp_saldo_insoluto=imp_saldo_insoluto,
+    ))
