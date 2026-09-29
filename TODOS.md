@@ -63,6 +63,13 @@ clasifica, el código calcula (Decimal, tolerancia cero). Migrado a producción 
       (tanto `/aprobar` de ANB como la confirmación del cliente) NUNCA funcionaron porque
       Telegram nunca entregaba esos eventos. Corregido re-registrando el webhook con
       `["message", "edited_message", "callback_query"]`.
+- [x] **Costo de Claude de $0.25-0.30 por conversación** (sep 2026) — causa raíz encontrada
+      reproduciendo conversaciones reales de Supabase: el historial de un chat NUNCA se
+      reiniciaba entre facturas/REPs ya completados, así que cada factura nueva pagaba por
+      reenviar TODO lo anterior como contexto (medido: $0.2168 de diferencia en un caso real
+      de 82 mensajes acumulados — coincide con lo reportado). Corregido con `history.clear()`
+      después de un tool_use exitoso + `/start` como reinicio explícito. Logging permanente de
+      costo por llamada (`claude_usage` en los logs de Railway) para monitorear esto en vivo.
 - [ ] **Revisar `aplica_ieps` de claves nuevas aprobadas** — hoy el botón "Aprobar" de
       ANB siempre guarda `aplica_ieps=False` por default (más seguro que sobre-cobrar);
       si una clave nueva SÍ lleva IEPS, hay que corregirlo a mano en Supabase después de
