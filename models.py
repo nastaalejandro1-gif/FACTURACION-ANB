@@ -42,6 +42,7 @@ class ConceptoItem(BaseModel):
     cantidad: float = Field(gt=0, default=1.0)
     clave_unidad: str = "E48"  # E48=Servicio (default despachos contables)
     precio_unitario: float = Field(gt=0)
+    ieps: float = Field(ge=0, default=0)  # IEPS de este concepto específico (0 si no aplica)
 
 
 class FacturaData(BaseModel):
@@ -82,6 +83,17 @@ class FacturaData(BaseModel):
             raise ValueError(
                 "Para método de pago PPD la forma de pago debe ser '99' (Por Definir). "
                 f"Se recibió '{self.forma_pago}'."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_ieps_breakdown(self) -> "FacturaData":
+        suma_ieps = sum(c.ieps for c in self.conceptos)
+        tolerancia = max(self.ieps * 0.02, 0.01)
+        if abs(suma_ieps - self.ieps) > tolerancia:
+            raise ValueError(
+                f"factura.ieps ({self.ieps:.2f}) no coincide con la suma de ieps "
+                f"por concepto ({suma_ieps:.2f}). Diferencia > 2%."
             )
         return self
 

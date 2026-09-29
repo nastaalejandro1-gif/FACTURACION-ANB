@@ -61,6 +61,10 @@ CLAUDE_TOOLS = [
                                         "description": "Clave SAT: E48=Servicio, H87=Pieza, KGM=Kilogramo, LTR=Litro, MTR=Metro",
                                     },
                                     "precio_unitario": {"type": "number"},
+                                    "ieps": {
+                                        "type": "number",
+                                        "description": "Monto de IEPS de este concepto. Solo para el producto gravado (ej. botana, papas). Para envío/flete y accesorios: 0.",
+                                    },
                                 },
                                 "required": ["descripcion", "clave_prod_serv", "cantidad", "clave_unidad", "precio_unitario"],
                             },
@@ -71,7 +75,7 @@ CLAUDE_TOOLS = [
                         },
                         "ieps": {
                             "type": "number",
-                            "description": "Monto de IEPS (0 si no aplica). ieps = monto_antes_impuestos * ieps_rate / 100",
+                            "description": "Suma del ieps de todos los conceptos. Debe coincidir con la suma de ieps por concepto.",
                         },
                         "iva": {"type": "number"},
                         "retencion_iva": {"type": "number"},

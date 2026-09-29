@@ -50,6 +50,22 @@ async def webhook(
 
 
 async def process_update(update: dict) -> None:
+    # Los callback_query (botones inline) se rutean antes que los mensajes
+    callback_query = update.get("callback_query")
+    if callback_query:
+        try:
+            await handle_callback_query(callback_query)
+        except Exception as exc:
+            logger.exception("Error no capturado en callback_query")
+            try:
+                await telegram_client.send_message(
+                    ALEJANDRO_CHAT_ID,
+                    f"🔴 Error crítico en callback_query\n{type(exc).__name__}: {exc}"
+                )
+            except Exception:
+                pass
+        return
+
     message = update.get("message") or update.get("edited_message")
     if not message:
         return
@@ -197,13 +213,17 @@ async def process_invoice(
         )
         await telegram_client.send_message(
             ALEJANDRO_CHAT_ID,
-            f"📋 *Factura pendiente de revisión*\n"
+            f"📋 Factura pendiente de revisión\n"
             f"Cliente: {client_profile.nombre_comercial}\n"
             f"ID: {invoice_id}\n"
             f"Motivo: {motivo}\n"
             f"Monto: ${invoice_data.factura.monto_antes_impuestos:,.2f}\n"
             f"Total: ${invoice_data.factura.total_estimado:,.2f}\n\n"
-            f"Responde:\n/aprobar {invoice_id}\n/rechazar {invoice_id}"
+            f"/aprobar {invoice_id}\n/rechazar {invoice_id}",
+            reply_markup={"inline_keyboard": [[
+                {"text": "✅ Aprobar", "callback_data": f"aprobar:{invoice_id}"},
+                {"text": "❌ Rechazar", "callback_data": f"rechazar:{invoice_id}"},
+            ]]},
         )
         await asyncio.to_thread(
             sheets_client.log_to_bitacora,
@@ -364,13 +384,17 @@ async def process_rep(
         )
         await telegram_client.send_message(
             ALEJANDRO_CHAT_ID,
-            f"📋 *REP pendiente de revisión*\n"
+            f"📋 REP pendiente de revisión\n"
             f"Cliente: {client_profile.nombre_comercial}\n"
             f"ID: {invoice_id}\n"
             f"UUID origen: {rep_data.uuid_factura_origen}\n"
             f"Monto pagado: ${rep_data.monto_pagado:,.2f}\n"
             f"Motivo: {motivo}\n\n"
-            f"/aprobar {invoice_id}\n/rechazar {invoice_id}"
+            f"/aprobar {invoice_id}\n/rechazar {invoice_id}",
+            reply_markup={"inline_keyboard": [[
+                {"text": "✅ Aprobar", "callback_data": f"aprobar:{invoice_id}"},
+                {"text": "❌ Rechazar", "callback_data": f"rechazar:{invoice_id}"},
+            ]]},
         )
         return
 
@@ -516,39 +540,26 @@ async def _timbre_and_deliver_rep(
 
 
 # ---------------------------------------------------------------------------
-# Approval commands (/aprobar, /rechazar)
+# Approval commands (/aprobar, /rechazar) — via text command or inline button
 # ---------------------------------------------------------------------------
 
-async def handle_approval_command(chat_id: str, message_id: int, text: str) -> None:
-    # CRITICAL: only Alejandro can approve/reject
-    if int(chat_id) != ALEJANDRO_CHAT_ID:
-        logger.warning("Usuario no autorizado intentó /aprobar o /rechazar: %s", chat_id)
-        return
-
-    parts = text.strip().split()
-    if len(parts) < 2:
-        await telegram_client.send_message(
-            ALEJANDRO_CHAT_ID,
-            "Formato: /aprobar {id} o /rechazar {id}"
-        )
-        return
-
-    command = parts[0].lower()
-    invoice_id = parts[1]
-
+async def _execute_approval(command: str, invoice_id: str) -> str:
+    """
+    Ejecuta 'aprobar' o 'rechazar' sobre invoice_id (sin barra inicial).
+    Envía todos los mensajes de notificación (cliente + despacho) igual que antes.
+    Retorna un texto corto de resultado para el popup de callback_query.
+    """
     pending = await asyncio.to_thread(sheets_client.get_pending, invoice_id)
     if not pending:
-        await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"No encontré la factura con ID: {invoice_id}")
-        return
+        msg = f"No encontré la factura con ID: {invoice_id}"
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+        return msg
 
-    # Idempotencia: un /aprobar repetido sobre algo ya procesado timbraría un CFDI duplicado
     estado_actual = str(pending.get("estado", ""))
     if estado_actual != "pendiente":
-        await telegram_client.send_message(
-            ALEJANDRO_CHAT_ID,
-            f"La solicitud {invoice_id} ya fue procesada (estado: {estado_actual}). No se timbró de nuevo."
-        )
-        return
+        msg = f"La solicitud {invoice_id} ya fue procesada (estado: {estado_actual}). No se timbró de nuevo."
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+        return msg
 
     client_canal_id = str(pending["canal_id"])
 
@@ -556,13 +567,14 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
         payload = json.loads(pending["invoice_json"])
     except Exception as exc:
         logger.exception("Error leyendo invoice_json para %s", invoice_id)
-        await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"Error al leer datos de la solicitud: {exc}")
-        return
+        msg = f"Error al leer datos de la solicitud: {exc}"
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+        return msg
 
-    # Los REPs en pendientes se distinguen por uuid_factura_origen (campo obligatorio de RepData)
+    # Los REPs se distinguen por uuid_factura_origen (campo obligatorio de RepData)
     es_rep = "uuid_factura_origen" in payload
 
-    if command == "/rechazar":
+    if command == "rechazar":
         await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "rechazado")
         await telegram_client.send_message(
             client_canal_id,
@@ -581,26 +593,26 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
             tipo="rep" if es_rep else "ingreso",
             uuid_factura_origen=payload.get("uuid_factura_origen", "") if es_rep else "",
         )
-        return
+        return f"{'REP' if es_rep else 'Factura'} rechazado."
 
-    # /aprobar — reconstruct data model and timbre
+    # aprobar — reconstruct data model and timbre
     try:
         data = RepData(**payload) if es_rep else InvoiceData(**payload)
     except Exception as exc:
         logger.exception("Error reconstruyendo datos para %s", invoice_id)
-        await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"Error al leer datos de la solicitud: {exc}")
-        return
+        msg = f"Error al leer datos de la solicitud: {exc}"
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+        return msg
 
-    # Retrieve the client profile to get their FacturAPI key
     canal = str(pending.get("canal", "telegram"))
     client_profile = await asyncio.to_thread(sheets_client.get_client_by_canal_id, canal, client_canal_id)
     if not client_profile:
-        await telegram_client.send_message(
-            ALEJANDRO_CHAT_ID,
+        msg = (
             f"⚠️ No encontré el perfil del cliente (canal_id: {client_canal_id}). "
             "No se puede timbrar sin la API key de FacturAPI."
         )
-        return
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+        return msg
 
     await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "aprobado")
     if es_rep:
@@ -609,6 +621,45 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
     else:
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⏳ Timbrando factura {invoice_id}...")
         await _timbre_and_deliver(invoice_id, data, client_profile, client_canal_id, 0)
+    return f"Timbrando {invoice_id}..."
+
+
+async def handle_approval_command(chat_id: str, message_id: int, text: str) -> None:
+    if int(chat_id) != ALEJANDRO_CHAT_ID:
+        logger.warning("Usuario no autorizado intentó /aprobar o /rechazar: %s", chat_id)
+        return
+
+    parts = text.strip().split()
+    if len(parts) < 2:
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            "Formato: /aprobar {id} o /rechazar {id}"
+        )
+        return
+
+    command = parts[0].lower().lstrip("/")
+    invoice_id = parts[1]
+    await _execute_approval(command, invoice_id)
+
+
+async def handle_callback_query(callback_query: dict) -> None:
+    callback_id = callback_query["id"]
+    chat_id = str(callback_query.get("message", {}).get("chat", {}).get("id", ""))
+    data = callback_query.get("data", "")
+
+    if not chat_id or int(chat_id) != ALEJANDRO_CHAT_ID:
+        logger.warning("Callback de aprobación de chat no autorizado: %s", chat_id)
+        await telegram_client.answer_callback_query(callback_id)
+        return
+
+    command, _, invoice_id = data.partition(":")
+    if command not in ("aprobar", "rechazar") or not invoice_id:
+        await telegram_client.answer_callback_query(callback_id, "Acción inválida")
+        return
+
+    # Responder de inmediato para quitar el spinner del botón
+    await telegram_client.answer_callback_query(callback_id, "Procesando...")
+    await _execute_approval(command, invoice_id)
 
 
 # ---------------------------------------------------------------------------
@@ -632,7 +683,11 @@ async def check_pending(x_cron_secret: Optional[str] = Header(None)):
             ALEJANDRO_CHAT_ID,
             f"⚠️ Factura sin revisión hace más de 24h\n"
             f"ID: {invoice_id}\nCliente canal_id: {canal_id}\nMotivo: {motivo}\n\n"
-            f"/aprobar {invoice_id}\n/rechazar {invoice_id}"
+            f"/aprobar {invoice_id}\n/rechazar {invoice_id}",
+            reply_markup={"inline_keyboard": [[
+                {"text": "✅ Aprobar", "callback_data": f"aprobar:{invoice_id}"},
+                {"text": "❌ Rechazar", "callback_data": f"rechazar:{invoice_id}"},
+            ]]},
         )
 
     return {"checked": len(overdue)}

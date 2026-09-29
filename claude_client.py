@@ -77,12 +77,11 @@ B) COTIZACIÓN / PRESUPUESTO: documento con lista de servicios o productos, cant
        KGM=Kilogramo (carne, granos, productos por peso)
        LTR=Litro, MTR=Metro, etc.
      Si no puedes inferirlo, usa H87 para productos y E48 para servicios.
-   - clave_prod_serv: USA SIEMPRE {profile.clave_prod_serv_default} para todos los conceptos
-     de este cliente. NUNCA inventes ni supongas otra clave SAT — el catálogo tiene 50,000
-     entradas y cualquier suposición tuya será incorrecta.
-     ÚNICA excepción: si el concepto es claramente incompatible con el default (ej. el cliente
-     vende un producto físico pero el default es clave de servicio), entonces pon
-     requiere_revision=True para que el despacho asigne la clave correcta manualmente.
+   - clave_prod_serv: USA {profile.clave_prod_serv_default} para el producto principal del cliente.
+     EXCEPCIÓN PERMITIDA: si el concepto es claramente envío / flete / paquetería / transporte,
+     usa la clave 78101800 (Transporte de carga) — es una clave bien conocida y no aplica IEPS.
+     CUALQUIER OTRA clave distinta al default: pon requiere_revision=True y explica en
+     motivo_revision qué clave asignaste y por qué.
    Después de extraer, muestra lo que encontraste y pregunta en UN SOLO MENSAJE lo que falta:
    uso CFDI, método de pago (PUE/PPD) y forma de pago.
 
@@ -105,8 +104,11 @@ FLUJO PRINCIPAL:
 7. Al confirmar, llama a generate_invoice_data con todos los datos.
 
 REGLAS FISCALES (son las del perfil — NO uses valores de conversaciones anteriores):
-- IEPS: {"APLICA — tasa " + str(profile.ieps_rate) + "%" if profile.ieps_rate > 0 else "NO aplica — ieps = 0 siempre"}
-  {"- ieps = monto_antes_impuestos * " + str(profile.ieps_rate) + " / 100" if profile.ieps_rate > 0 else ""}
+- IEPS: {"APLICA — tasa " + str(profile.ieps_rate) + "% — PERO SOLO en los conceptos que son el producto gravado del cliente (su giro principal). Los accesorios NO llevan IEPS." if profile.ieps_rate > 0 else "NO aplica — ieps = 0 siempre en todos los conceptos"}
+  {"Regla por concepto:" if profile.ieps_rate > 0 else ""}
+  {"  - Producto gravado (ej. botana, papas, etc.): concepto.ieps = concepto.cantidad * concepto.precio_unitario * " + str(profile.ieps_rate) + " / 100" if profile.ieps_rate > 0 else ""}
+  {"  - Accesorio (envío, flete, paquetería, instalación, etc.): concepto.ieps = 0" if profile.ieps_rate > 0 else ""}
+  {"  - factura.ieps = SUMA de concepto.ieps de todos los conceptos" if profile.ieps_rate > 0 else ""}
 - IVA: {"16% sobre (monto_antes_impuestos + ieps). iva = (monto_antes_impuestos + ieps) * 0.16" if profile.ieps_rate > 0 else "16% sobre el subtotal. iva = monto_antes_impuestos * 0.16"}
   {"" if profile.iva_aplica in ("SÍ", "SI") else "IVA aplica = " + profile.iva_aplica + " — revisa antes de aplicar."}
   NUNCA pongas iva = 0 si IVA aplica = {profile.iva_aplica}.
@@ -192,7 +194,11 @@ def run_conversation_turn(
     else:
         raise ValueError("Se requiere texto o archivo para el turno de conversación")
 
-    system = build_system_prompt(profile)
+    system = [{
+        "type": "text",
+        "text": build_system_prompt(profile),
+        "cache_control": {"type": "ephemeral"},
+    }]
 
     for cycle in range(MAX_TOOL_CYCLES):
         response = client.messages.create(

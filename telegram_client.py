@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 import httpx
 
@@ -10,13 +11,16 @@ BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 TIMEOUT = 20.0
 
 
-async def send_message(chat_id: int | str, text: str) -> None:
+async def send_message(
+    chat_id: int | str,
+    text: str,
+    reply_markup: Optional[dict] = None,
+) -> None:
+    payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        response = await client.post(f"{BASE}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-        })
+        response = await client.post(f"{BASE}/sendMessage", json=payload)
         if response.status_code == 200:
             return
         # Causa más común de rechazo: el texto contiene < o > que Telegram
@@ -25,14 +29,27 @@ async def send_message(chat_id: int | str, text: str) -> None:
             "Telegram sendMessage falló (%s): %s — reintentando sin HTML",
             response.status_code, response.text[:200],
         )
-        retry = await client.post(f"{BASE}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": text,
-        })
+        retry_payload: dict = {"chat_id": chat_id, "text": text}
+        if reply_markup:
+            retry_payload["reply_markup"] = reply_markup
+        retry = await client.post(f"{BASE}/sendMessage", json=retry_payload)
         if retry.status_code != 200:
             logger.error(
                 "Telegram sendMessage falló definitivamente para %s (%s): %s",
                 chat_id, retry.status_code, retry.text[:200],
+            )
+
+
+async def answer_callback_query(callback_query_id: str, text: str = "") -> None:
+    payload: dict = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text[:200]
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        response = await client.post(f"{BASE}/answerCallbackQuery", json=payload)
+        if response.status_code != 200:
+            logger.error(
+                "answerCallbackQuery falló (%s): %s",
+                response.status_code, response.text[:200],
             )
 
 

@@ -44,8 +44,6 @@ _facturapi_retry_write = retry(
 
 
 def _build_facturapi_payload(data: InvoiceData) -> dict:
-    taxes = _build_taxes(data)
-
     items = [
         {
             "quantity": concepto.cantidad,
@@ -55,7 +53,7 @@ def _build_facturapi_payload(data: InvoiceData) -> dict:
                 "price": concepto.precio_unitario,
                 "tax_included": False,
                 "unit_key": concepto.clave_unidad,
-                "taxes": taxes,
+                "taxes": _build_taxes_for_concepto(concepto, data),
             },
         }
         for concepto in data.factura.conceptos
@@ -78,13 +76,14 @@ def _build_facturapi_payload(data: InvoiceData) -> dict:
     }
 
 
-def _build_taxes(data: InvoiceData) -> list:
+def _build_taxes_for_concepto(concepto, data: InvoiceData) -> list:
     taxes = []
+    subtotal_concepto = concepto.cantidad * concepto.precio_unitario
 
-    if data.factura.ieps > 0:
+    if concepto.ieps > 0:
         taxes.append({
             "type": "IEPS",
-            "rate": round(data.factura.ieps / data.factura.monto_antes_impuestos, 6),
+            "rate": round(concepto.ieps / subtotal_concepto, 6),
             "factor": "Tasa",
             "withholding": False,
         })
