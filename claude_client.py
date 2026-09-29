@@ -17,6 +17,38 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 MAX_TOOL_CYCLES = 3
 
+# Precios por millón de tokens (USD) — Claude Sonnet. Ajustar si cambia el
+# modelo (ANTHROPIC_MODEL) o su tarifa.
+PRECIO_INPUT_POR_MILLON = 3.0
+PRECIO_OUTPUT_POR_MILLON = 15.0
+PRECIO_CACHE_WRITE_POR_MILLON = 3.75
+PRECIO_CACHE_READ_POR_MILLON = 0.30
+
+
+def _log_uso_claude(paso: str, response: anthropic.types.Message) -> None:
+    """
+    Logging permanente de costo por llamada a la API — visible en los logs
+    de Railway. `paso` identifica en qué parte del flujo ocurrió la
+    llamada (extracción de documento, turno de texto, qué tool se llamó o
+    si fue un reintento por validación fallida), para poder ver en qué
+    parte de una conversación se concentra el costo.
+    """
+    usage = response.usage
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    costo = (
+        usage.input_tokens * PRECIO_INPUT_POR_MILLON
+        + usage.output_tokens * PRECIO_OUTPUT_POR_MILLON
+        + cache_write * PRECIO_CACHE_WRITE_POR_MILLON
+        + cache_read * PRECIO_CACHE_READ_POR_MILLON
+    ) / 1_000_000
+    logger.info(
+        "claude_usage paso=%s modelo=%s input_tokens=%d output_tokens=%d "
+        "cache_read_tokens=%d cache_write_tokens=%d costo_usd=%.6f",
+        paso, ANTHROPIC_MODEL, usage.input_tokens, usage.output_tokens,
+        cache_read, cache_write, costo,
+    )
+
 
 def _render_regimenes() -> str:
     return "\n".join(f"  {codigo} = {nombre}" for codigo, nombre in REGIMENES_FISCALES_VALIDOS.items())
@@ -210,6 +242,8 @@ def run_conversation_turn(
     else:
         raise ValueError("Se requiere texto o archivo para el turno de conversación")
 
+    paso_base = "extraccion_documento" if (file_bytes and media_type) else "turno_texto"
+
     system = [{
         "type": "text",
         "text": build_system_prompt(profile, catalogo),
@@ -260,6 +294,7 @@ def run_conversation_turn(
                         result_data = RepDraft(**tool_input)
                 except ValidationError as e:
                     logger.warning("Validación de %s falló: %s", tool_name, e)
+                    _log_uso_claude(f"{paso_base}→retry_validacion_{tool_name}", response)
                     history.append({
                         "role": "user",
                         "content": [{
@@ -306,6 +341,7 @@ def run_conversation_turn(
                             for b in msg["content"]
                         ]
 
+                _log_uso_claude(f"{paso_base}→{tool_name}", response)
                 if isinstance(result_data, InvoiceDraft):
                     return client_message, result_data, None
                 else:
@@ -313,6 +349,7 @@ def run_conversation_turn(
 
         else:
             # Regular text response — no tool call
+            _log_uso_claude(f"{paso_base}→respuesta_texto", response)
             client_message = extract_text_from_response(response) or "En un momento te ayudo."
             history.append({
                 "role": "assistant",
