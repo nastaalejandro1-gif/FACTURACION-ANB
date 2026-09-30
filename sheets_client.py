@@ -288,6 +288,50 @@ def is_message_already_processed(canal_id: str, telegram_message_id: int) -> boo
 # Bitácora
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class FacturaReciente:
+    tipo: str  # 'ingreso' | 'rep'
+    rfc_receptor: str
+    total: float
+    timestamp: str
+    estado: str
+    folio_fiscal: str
+    uuid_factura_origen: str
+
+
+def get_facturas_recientes(despacho_id: str, canal_id: str, limite: int = 3) -> list[FacturaReciente]:
+    """
+    Últimas facturas/REPs de bitácora para este canal_id (fuente de verdad
+    de qué se timbró, no el historial de chat con Claude). Se usa para que
+    el prompt pueda responder "cancela la que acabas de hacer" o "otra
+    igual" sin necesitar guardar la conversación completa — ver
+    claude_client.build_system_prompt.
+    """
+    sb = _get_supabase()
+    canal_id_str = str(int(float(canal_id)))
+    result = (
+        sb.table("bitacora")
+        .select("*")
+        .eq("despacho_id", despacho_id)
+        .eq("canal_id", canal_id_str)
+        .order("timestamp", desc=True)
+        .limit(limite)
+        .execute()
+    )
+    return [
+        FacturaReciente(
+            tipo=row.get("tipo", "ingreso"),
+            rfc_receptor=row.get("rfc_receptor", ""),
+            total=float(row.get("total") or 0),
+            timestamp=row.get("timestamp", ""),
+            estado=row.get("estado", ""),
+            folio_fiscal=row.get("folio_fiscal", ""),
+            uuid_factura_origen=row.get("uuid_factura_origen", ""),
+        )
+        for row in (result.data or [])
+    ]
+
+
 def get_rep_history(uuid_factura_origen: str) -> list[dict]:
     """Retorna los REPs timbrados para un UUID de factura origen, ordenados por timestamp.
 

@@ -46,6 +46,15 @@ def build_invoice_tools(claves_catalogo: list[str]) -> list[dict]:
                         "type": "string",
                         "enum": ["confirmado_por_cliente"],
                     },
+                    "mas_pedidos_en_este_lote": {
+                        "type": "boolean",
+                        "description": (
+                            "true SOLO si el cliente pidió más de una factura o REP en el "
+                            "mismo mensaje y todavía falta procesar al menos uno después de "
+                            "este. false (o simplemente omite el campo) si este es el único "
+                            "pedido, o el último del lote."
+                        ),
+                    },
                     "receptor": {
                         "type": "object",
                         "properties": {
@@ -128,6 +137,15 @@ def build_invoice_tools(claves_catalogo: list[str]) -> list[dict]:
                 "type": "object",
                 "properties": {
                     "estatus": {"type": "string", "enum": ["confirmado_por_cliente"]},
+                    "mas_pedidos_en_este_lote": {
+                        "type": "boolean",
+                        "description": (
+                            "true SOLO si el cliente pidió más de una factura o REP en el "
+                            "mismo mensaje y todavía falta procesar al menos uno después de "
+                            "este. false (o simplemente omite el campo) si este es el único "
+                            "pedido, o el último del lote."
+                        ),
+                    },
                     "uuid_factura_origen": {
                         "type": "string",
                         "description": "UUID / Folio Fiscal del CFDI PPD original. Formato: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",

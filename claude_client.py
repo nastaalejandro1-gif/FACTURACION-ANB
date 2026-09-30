@@ -1,5 +1,6 @@
 import base64
 import logging
+import re
 from typing import Optional
 
 import anthropic
@@ -8,7 +9,7 @@ from pydantic import ValidationError
 from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
 from models import ClientProfile, InvoiceDraft, RepDraft
 from sat_catalogs import REGIMENES_FISCALES_VALIDOS
-from sheets_client import ClaveCatalogo, strip_binary_in_place
+from sheets_client import ClaveCatalogo, FacturaReciente, strip_binary_in_place
 from tools import build_invoice_tools
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,48 @@ PRECIO_INPUT_POR_MILLON = 3.0
 PRECIO_OUTPUT_POR_MILLON = 15.0
 PRECIO_CACHE_WRITE_POR_MILLON = 3.75
 PRECIO_CACHE_READ_POR_MILLON = 0.30
+
+# Tope de seguridad: si una conversación se alarga sin completar ninguna
+# factura/REP (cliente indeciso, "hola"/"gracias" sueltos, intentos
+# abandonados) el historial podría crecer indefinidamente igual que antes
+# de que se agregara el reinicio condicional de abajo. Por encima de este
+# tamaño se recorta a los últimos HISTORY_TRIM_KEEP mensajes.
+MAX_HISTORY_MESSAGES = 40
+HISTORY_TRIM_KEEP = 16
+
+# Si el mensaje de confirmación de Claude tras un tool_use exitoso menciona
+# alguna de estas frases, hay MÁS pedidos del mismo lote todavía pendientes
+# (ej. cliente pidió "factura A y REP B" junto, Claude resuelve uno por
+# turno) — no hay que reiniciar el historial todavía o se pierde el
+# contexto del/los pedido(s) que faltan. Heurística de texto, no perfecta,
+# pero el respaldo es el tope de arriba: aunque falle, el historial no
+# crece sin límite.
+_PATRON_PEDIDO_PENDIENTE = re.compile(
+    r"(otra factura|otra solicitud|segunda solicitud|tercera solicitud|"
+    r"la siguiente|sigo con|ahora paso a|solicitud 2|solicitud 3|"
+    r"la otra factura|el otro pedido|el otro rep)",
+    re.IGNORECASE,
+)
+
+
+def _recortar_historial_si_excede(history: list) -> None:
+    if len(history) <= MAX_HISTORY_MESSAGES:
+        return
+    corte = len(history) - HISTORY_TRIM_KEEP
+    # Nunca empezar el recorte justo en un tool_result huérfano (dejaría
+    # su tool_use del turno anterior fuera, y la API rechazaría el
+    # siguiente turno) — retroceder al tool_use correspondiente si hace falta.
+    while corte > 0:
+        content = history[corte].get("content")
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        ):
+            corte -= 1
+        else:
+            break
+    if corte > 0:
+        logger.info("Historial recortado de %d a %d mensajes (tope de seguridad)", len(history), len(history) - corte)
+        del history[:corte]
 
 
 def _log_uso_claude(paso: str, response: anthropic.types.Message) -> None:
@@ -60,7 +103,23 @@ def _render_catalogo(catalogo: list[ClaveCatalogo]) -> str:
     return "\n".join(f"  {c.clave_prod_serv} = {c.descripcion_clave}" for c in catalogo)
 
 
-def build_system_prompt(profile: ClientProfile, catalogo: list[ClaveCatalogo]) -> str:
+def _render_facturas_recientes(facturas: list[FacturaReciente]) -> str:
+    if not facturas:
+        return "  (sin facturas previas registradas para este cliente)"
+    lineas = []
+    for f in facturas:
+        tipo_texto = "REP" if f.tipo == "rep" else "Factura"
+        referencia = f.folio_fiscal or f.uuid_factura_origen or "sin folio"
+        lineas.append(
+            f"  {tipo_texto} | receptor RFC {f.rfc_receptor} | total ${f.total:,.2f} | "
+            f"{f.timestamp[:16]} | estado: {f.estado} | folio/UUID: {referencia}"
+        )
+    return "\n".join(lineas)
+
+
+def build_system_prompt(
+    profile: ClientProfile, catalogo: list[ClaveCatalogo], facturas_recientes: list[FacturaReciente],
+) -> str:
     return f"""Eres un asistente de facturación del Despacho ANB Consultores. Tu función es recolectar y clasificar la información necesaria para preparar una solicitud de CFDI 4.0 en México.
 
 Tu trabajo NO es calcular impuestos ni timbrar facturas directamente. Tu trabajo es:
@@ -85,6 +144,18 @@ TONO:
 
 CATÁLOGO DE REGÍMENES FISCALES SAT (úsalo siempre — no inventes códigos):
 {_render_regimenes()}
+
+ÚLTIMAS FACTURAS/REPS DE ESTE CLIENTE (para referencia si menciona "la anterior",
+"la que acabas de hacer", o pide "otra igual" — el historial de esta conversación se
+reinicia después de cada factura completada, así que ESTA es tu única memoria de lo
+que ya se procesó; NO tienes los conceptos línea por línea de facturas pasadas, solo
+este resumen):
+{_render_facturas_recientes(facturas_recientes)}
+Si el cliente pide cancelar o corregir una factura ya timbrada, es FUERA DE ALCANCE
+(ver abajo) — puedes usar este resumen para identificar CUÁL menciona y dar una
+respuesta más útil, pero igual debes remitirlo al despacho, nunca intentar cancelarla
+tú. Si pide "otra igual" pero a otro RFC, no tienes los conceptos exactos de la
+anterior — pide que te los reenvíe o comparta la cotización de nuevo.
 
 CATÁLOGO DE CLAVES DE PRODUCTO/SERVICIO APROBADAS PARA ESTE CLIENTE:
 {_render_catalogo(catalogo)}
@@ -175,6 +246,17 @@ Cuando el cliente manda un CFDI (PDF de factura con folio fiscal UUID) avisando 
    "¡Listo! En un momento te mando el resumen del complemento de pago para que lo confirmes
    antes de timbrarlo. 📊"
 
+VARIOS PEDIDOS EN EL MISMO MENSAJE:
+Si el cliente junta más de un pedido (ej. "te aviso que pagaron la factura X, y además
+necesito una factura nueva para Y") solo puedes llamar UNA herramienta por turno — resuelve
+primero uno (el que tenga todos los datos completos, o el que el cliente mencionó primero)
+y avísale que sigues con el/los otro(s) después. Es CRÍTICO que al llamar generate_invoice_draft
+o generate_rep_draft en este caso pongas mas_pedidos_en_este_lote=true — el sistema usa ese
+campo (no tu mensaje de texto) para saber si debe conservar el contexto de los pedidos que
+faltan. Si te falta algún dato del segundo pedido, pídelo en el mismo mensaje de confirmación
+del primero. Cuando proceses el ÚLTIMO pedido del lote, omite el campo o pon
+mas_pedidos_en_este_lote=false.
+
 FUERA DE ALCANCE:
 Si el cliente pide algo que este flujo no puede procesar — nota de crédito, cancelación de
 un CFDI ya timbrado, corrección de una factura ya emitida, o cualquier otra gestión que no
@@ -217,6 +299,7 @@ def run_conversation_turn(
     profile: ClientProfile,
     catalogo: list[ClaveCatalogo],
     history: list,
+    facturas_recientes: list[FacturaReciente],
     user_text: Optional[str] = None,
     file_bytes: Optional[bytes] = None,
     media_type: Optional[str] = None,
@@ -242,11 +325,13 @@ def run_conversation_turn(
     else:
         raise ValueError("Se requiere texto o archivo para el turno de conversación")
 
+    _recortar_historial_si_excede(history)
+
     paso_base = "extraccion_documento" if (file_bytes and media_type) else "turno_texto"
 
     system = [{
         "type": "text",
-        "text": build_system_prompt(profile, catalogo),
+        "text": build_system_prompt(profile, catalogo, facturas_recientes),
         "cache_control": {"type": "ephemeral"},
     }]
 
@@ -275,6 +360,12 @@ def run_conversation_turn(
             tool_block = next(b for b in response.content if b.type == "tool_use")
             tool_name = tool_block.name
             tool_input = tool_block.input
+            # Señal ESTRUCTURADA (no adivinada por texto libre) de que el
+            # cliente juntó varios pedidos en un mismo mensaje y todavía
+            # queda al menos uno por procesar — ver tools.py. InvoiceDraft/
+            # RepDraft no declaran este campo, así que Pydantic lo ignora
+            # sin problema al construir el draft más abajo.
+            mas_pedidos_pendientes = bool(tool_input.get("mas_pedidos_en_este_lote", False))
 
             # Add assistant response to history (convert blocks to dicts)
             history.append({
@@ -342,7 +433,24 @@ def run_conversation_turn(
                 # mensajes acumulados) — y peor, Claude puede confundirse
                 # con contexto de pedidos viejos ya resueltos y no disparar
                 # la herramienta cuando debería.
-                history.clear()
+                #
+                # EXCEPCIÓN: si el cliente juntó varios pedidos en el mismo
+                # lote (ej. "factura A y REP B" en un solo mensaje), Claude
+                # resuelve uno por turno (disable_parallel_tool_use). Reiniciar
+                # aquí perdería el contexto de los pedidos que faltan del
+                # MISMO lote. Se detecta por la señal ESTRUCTURADA del tool
+                # (mas_pedidos_pendientes, arriba) — un patrón de texto libre
+                # ("sigo con la otra factura") resultó no confiable: Claude
+                # a veces avisa con frases que no coinciden con ningún patrón
+                # razonable ("proceso los dos al mismo tiempo 🚀", etc.).
+                # El patrón de texto queda como red de respaldo (por si
+                # Claude no marca el campo estructurado pero su frase de
+                # todas formas delata que hay más pendiente) — no como
+                # mecanismo principal.
+                if mas_pedidos_pendientes or _PATRON_PEDIDO_PENDIENTE.search(client_message):
+                    logger.info("No se reinicia el historial: el cliente aún tiene otro pedido pendiente en este lote.")
+                else:
+                    history.clear()
 
                 _log_uso_claude(f"{paso_base}→{tool_name}", response)
                 if isinstance(result_data, InvoiceDraft):

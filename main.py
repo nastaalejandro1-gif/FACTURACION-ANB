@@ -146,6 +146,9 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
     catalogo = await asyncio.to_thread(
         sheets_client.get_catalogo_claves, client_profile.despacho_id, client_profile.id_cliente
     )
+    facturas_recientes = await asyncio.to_thread(
+        sheets_client.get_facturas_recientes, client_profile.despacho_id, chat_id
+    )
 
     # Extract text and/or file
     user_text: Optional[str] = message.get("text") or message.get("caption")
@@ -180,6 +183,7 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
             profile=client_profile,
             catalogo=catalogo,
             history=history,
+            facturas_recientes=facturas_recientes,
             user_text=user_text,
             file_bytes=file_bytes,
             media_type=media_type,
