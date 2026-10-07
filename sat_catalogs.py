@@ -6,8 +6,7 @@ catálogo oficial del SAT para CFDI 4.0.
 """
 
 # ---------------------------------------------------------------------------
-# Regímenes fiscales — catálogo SAT (los mismos 17 códigos que ya usaba el
-# prompt de claude_client.py). Sirve para que Claude no invente un código al
+# Regímenes fiscales — catálogo SAT c_RegimenFiscal. Sirve para que Claude no invente un código al
 # leer una CSF, y para el motor de cálculo (validate_regimen_fiscal).
 # ---------------------------------------------------------------------------
 
@@ -22,11 +21,15 @@ REGIMENES_FISCALES_VALIDOS: dict[str, str] = {
     "611": "Ingresos por Dividendos (socios y accionistas)",
     "612": "Personas Físicas con Actividades Empresariales y Profesionales",
     "614": "Ingresos por intereses",
+    "615": "Régimen de los ingresos por obtención de premios",
     "616": "Sin obligaciones fiscales",
-    "621": "RESICO Personas Físicas",
+    "620": "Sociedades Cooperativas de Producción que optan por diferir sus ingresos",
+    "621": "Incorporación Fiscal (RIF)",
     "622": "Actividades Agrícolas, Ganaderas, Silvícolas y Pesqueras",
+    "623": "Opcional para Grupos de Sociedades",
+    "624": "Coordinados",
     "625": "Régimen de Actividades Empresariales con ingresos a través de Plataformas Tecnológicas",
-    "626": "RESICO Personas Morales",
+    "626": "Régimen Simplificado de Confianza (RESICO) — aplica a personas físicas y morales",
     "628": "Hidrocarburos",
     "629": "De los Regímenes Fiscales Preferentes y de las Empresas Multinacionales",
 }
@@ -34,12 +37,17 @@ REGIMENES_FISCALES_VALIDOS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # Régimen fiscal -> tipo de persona esperado, SOLO para los códigos que el
 # despacho ya etiquetaba de forma inequívoca en el prompt de producción
-# anterior (601, 603 = PM; 605-614, 621, 625 = PF; 626 = PM).
+# anterior (601, 603 = PM; 605-614, 621, 625 = PF), más 626 = PF o PM.
 #
-# Los códigos que el despacho NUNCA etiquetó como PF/PM exclusivo (610, 616,
-# 622, 628, 629 — el catálogo oficial SAT los permite para ambos tipos de
-# persona) se dejan fuera de este dict a propósito: no se inventa una
-# restricción no verificada. Para esos códigos, fiscal_engine no hace
+# OJO: el prompt anterior etiquetaba 621 como "RESICO PF" y 626 como "RESICO
+# PM" — ERROR. Oficialmente 621 = Incorporación Fiscal (RIF) y 626 = RESICO
+# para ambos tipos de persona. Claude mapeaba CSFs de RESICO PF a 621.
+#
+# Verificado (oct 2026) contra las columnas Física/Moral de c_RegimenFiscal:
+# solo 610 y 626 aplican a ambos. 615/616 = PF; 620/622/623/624 = PM (antes
+# se asumía que 616 y 622 servían para ambos — no es así). 610 queda fuera
+# del dict porque acepta ambos; 628/629 quedan fuera porque no se pudo
+# confirmar su columna Física/Moral — no se inventa una restricción. Para esos códigos, fiscal_engine no hace
 # validación cruzada régimen<->tipo_persona, solo usa tipo_persona_from_rfc.
 #
 # Fuente de verdad real de tipo_persona: la longitud del RFC (ver
@@ -59,9 +67,16 @@ REGIMEN_FISCAL_TIPO_PERSONA: dict[str, frozenset[str]] = {
     "611": frozenset({"PF"}),
     "612": frozenset({"PF"}),
     "614": frozenset({"PF"}),
+    "615": frozenset({"PF"}),
+    "616": frozenset({"PF"}),
+    "620": frozenset({"PM"}),
     "621": frozenset({"PF"}),
+    "622": frozenset({"PM"}),
+    "623": frozenset({"PM"}),
+    "624": frozenset({"PM"}),
     "625": frozenset({"PF"}),
-    "626": frozenset({"PM"}),
+    # RESICO existe para PF (Título IV) y PM (Título VII) bajo el mismo código.
+    "626": frozenset({"PF", "PM"}),
 }
 
 

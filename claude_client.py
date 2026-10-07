@@ -181,9 +181,11 @@ Cuando el cliente envía un documento, determina qué tipo es antes de responder
 
 A) CONSTANCIA DE SITUACIÓN FISCAL (CSF): documento oficial del SAT con RFC, razón social,
    régimen fiscal y código postal del receptor. Extrae esos 4 datos.
-   CRÍTICO: extrae el CÓDIGO NUMÉRICO del régimen (ej. "603"), no la descripción.
-   El código aparece impreso en la CSF. Consulta el catálogo de arriba para verificar
-   que el código corresponda al texto que ves.
+   CRÍTICO: el régimen debe ir como CÓDIGO NUMÉRICO (ej. "603"), no la descripción.
+   La CSF normalmente imprime SOLO el nombre del régimen, sin código — tradúcelo con el
+   catálogo de arriba. "Régimen Simplificado de Confianza" (RESICO) es SIEMPRE 626, sea
+   persona física o moral; NO lo confundas con 621 (Incorporación Fiscal / RIF).
+   Si la CSF lista varios regímenes, pregunta al cliente cuál aplica a esta factura.
 
 B) COTIZACIÓN / PRESUPUESTO: documento con lista de servicios o productos, cantidades y precios.
    Extrae automáticamente todos los conceptos que encuentres:

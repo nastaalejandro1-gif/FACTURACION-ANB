@@ -74,9 +74,17 @@ clasifica, el código calcula (Decimal, tolerancia cero). Migrado a producción 
       ANB siempre guarda `aplica_ieps=False` por default (más seguro que sobre-cobrar);
       si una clave nueva SÍ lleva IEPS, hay que corregirlo a mano en Supabase después de
       aprobar.
-- [ ] **Push a origin/main + deploy** — todo el restructure está en 8 commits locales,
-      nada pusheado todavía. Requiere confirmación explícita antes de hacer push (el bot
-      está en producción con clientes reales).
+- [x] **Push a origin/main + deploy** — pusheado (714c260).
+- [x] **Catálogo de regímenes mal etiquetado** (oct 2026) — 621 decía "RESICO PF" y 626
+      "RESICO PM"; oficialmente 621 = RIF y 626 = RESICO para PF y PM. Claude mapeaba CSFs de
+      RESICO PF a 621 (caso real: factura de Envoy a POAA980325TIA salió con 621). Corregido el
+      catálogo, la restricción PF/PM de 626, 616 y 622, y se agregaron 615/620/623/624.
+- [ ] **Organización de Sin Culpa en FacturAPI con régimen 601** — Andrea Lozano es PF (RFC
+      de 13) y su retención ISR 1.25% indica RESICO → debe ser 626. 601 es exclusivo de PM; en
+      live el SAT lo rechazaría. Corregir en el dashboard de FacturAPI ANTES de pasar a live.
+- [ ] **Retención IVA 10.6667% de Sin Culpa** — confirmar que aplica: la retención de 2/3 del
+      IVA es para servicios/arrendamiento/fletes de PF a PM, no para venta de bienes (Sin Culpa
+      vende alimentos con IEPS).
 - [ ] Pasar FacturAPI de sandbox a live — cuando terminen las pruebas del restructure
 - [ ] Agregar los 13 clientes restantes en Supabase (clientes + reglas_fiscales_cliente +
       catalogo_clave_prod_serv) — hoy solo Envoy y Sin Culpa están migrados
