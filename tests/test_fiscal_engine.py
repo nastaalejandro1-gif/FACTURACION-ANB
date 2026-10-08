@@ -168,6 +168,24 @@ def test_escalamiento_total_fuente_no_coincide_con_suma_conceptos():
     assert resultado.escalation.reason == EscalationReason.VALIDACION_ARITMETICA
 
 
+@pytest.mark.parametrize("total_fuente", ["5000.00", "5800.00"])
+def test_total_fuente_acepta_subtotal_o_total_con_iva(total_fuente):
+    # Caso real (Envoy): la cotización imprimía el TOTAL con IVA
+    # ($37,463.94 = $32,296.50 × 1.16) y el motor escalaba porque solo
+    # comparaba contra el subtotal.
+    conceptos = [ConceptoExtraido(
+        descripcion="Servicio", cantidad=Decimal("1"),
+        precio_unitario=Decimal("5000.00"), clave_unidad="E48",
+        clave_prod_serv="78101803",
+    )]
+    resultado = calcular_factura(
+        conceptos, RECEPTOR_PF, REGLAS_SIN_IEPS_SIN_RETENCION, "PUE", "03",
+        total_documento_fuente=Decimal(total_fuente),
+    )
+    assert resultado.escalation is None
+    assert resultado.factura.total == Decimal("5800.00")
+
+
 def test_escalamiento_por_regimen_incongruente_con_rfc():
     # RFC de 12 chars (PM) pero régimen fiscal 612 = PF exclusivo.
     receptor_incongruente = ReceptorData(
@@ -371,3 +389,17 @@ def test_omitir_validacion_cruzada_tambien_permite_pasar_monto_alto():
     )
     assert resultado.escalation is None
     assert resultado.factura.total == Decimal("232000.00")
+
+
+def test_caso_envoy_total_con_iva_no_escala():
+    # Caso real: subtotal $32,296.50, cotización con TOTAL $37,463.94 (con IVA).
+    conceptos = [ConceptoExtraido(
+        descripcion="Servicio", cantidad=Decimal("1"),
+        precio_unitario=Decimal("32296.50"), clave_unidad="E48",
+        clave_prod_serv="78101803",
+    )]
+    resultado = calcular_factura(
+        conceptos, RECEPTOR_PF, REGLAS_SIN_IEPS_SIN_RETENCION, "PUE", "03",
+        total_documento_fuente=Decimal("37463.94"),
+    )
+    assert resultado.escalation is None or resultado.escalation.reason != EscalationReason.VALIDACION_ARITMETICA

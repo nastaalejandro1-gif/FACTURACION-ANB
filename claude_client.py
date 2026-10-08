@@ -6,7 +6,7 @@ from typing import Optional
 import anthropic
 from pydantic import ValidationError
 
-from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from config import ANTHROPIC_API_KEY, ANTHROPIC_EFFORT, ANTHROPIC_MODEL
 from models import ClientProfile, InvoiceDraft, RepDraft
 from sat_catalogs import REGIMENES_FISCALES_VALIDOS
 from sheets_client import ClaveCatalogo, FacturaReciente, strip_binary_in_place
@@ -18,12 +18,19 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 MAX_TOOL_CYCLES = 3
 
-# Precios por millón de tokens (USD) — Claude Sonnet. Ajustar si cambia el
-# modelo (ANTHROPIC_MODEL) o su tarifa.
-PRECIO_INPUT_POR_MILLON = 3.0
-PRECIO_OUTPUT_POR_MILLON = 15.0
-PRECIO_CACHE_WRITE_POR_MILLON = 3.75
-PRECIO_CACHE_READ_POR_MILLON = 0.30
+# Precios por millón de tokens (USD): input, output, cache write (5 min),
+# cache read. Solo para el log de costo; agregar aquí si se usa otro modelo.
+PRECIOS_POR_MILLON = {
+    "claude-haiku-5-5": (0.10, 0.50, 0.125, 0.01),
+    "claude-sonnet-5-5": (2.0, 10.0, 2.50, 0.20),
+    "claude-sonnet-4-6": (3.0, 15.0, 3.75, 0.30),
+}
+(
+    PRECIO_INPUT_POR_MILLON,
+    PRECIO_OUTPUT_POR_MILLON,
+    PRECIO_CACHE_WRITE_POR_MILLON,
+    PRECIO_CACHE_READ_POR_MILLON,
+) = PRECIOS_POR_MILLON.get(ANTHROPIC_MODEL, PRECIOS_POR_MILLON["claude-sonnet-4-6"])
 
 # Tope de seguridad: si una conversación se alarga sin completar ninguna
 # factura/REP (cliente indeciso, "hola"/"gracias" sueltos, intentos
@@ -356,6 +363,10 @@ def run_conversation_turn(
             tools=tools,
             tool_choice=tool_choice,
             messages=history,
+            # Cachea también el historial (no solo system+tools): cada turno
+            # reenvía la conversación completa, y sin esto se pagaba entera.
+            cache_control={"type": "ephemeral"},
+            output_config={"effort": ANTHROPIC_EFFORT},
         )
 
         if response.stop_reason == "tool_use":

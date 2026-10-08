@@ -113,8 +113,8 @@ def build_invoice_tools(claves_catalogo: list[str]) -> list[dict]:
                                 "type": "number",
                                 "description": (
                                     "Total impreso en la cotización/documento fuente, si lo viste "
-                                    "explícitamente. Omite este campo si no hay documento o no "
-                                    "muestra un total."
+                                    "explícitamente, tal como aparece (con o sin IVA). Omite este "
+                                    "campo si no hay documento o no muestra un total."
                                 ),
                             },
                         },

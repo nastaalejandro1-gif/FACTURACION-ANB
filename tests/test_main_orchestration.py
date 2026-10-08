@@ -295,3 +295,84 @@ async def test_confirmacion_cliente_de_rep_reconstruye_fresco_y_timbra(monkeypat
     assert invoice_id == "rep-1"
     assert num_parcialidad == 1
     assert original_invoice == {"total": 5000.0}
+
+
+# ---------------------------------------------------------------------------
+# Aprobación de ANB: siempre avisa a ANB si se envió al cliente o no
+# ---------------------------------------------------------------------------
+
+def _pending_anb(draft: InvoiceDraft, reason: str = "validacion_aritmetica") -> dict:
+    envelope = main.PendingPayload(
+        tipo="ingreso", escalation_reason=reason,
+        escalation_detail="detalle", invoice_draft=draft,
+    )
+    return {
+        "id": "inv-9", "estado": "pendiente", "tipo_aprobacion": "anb_revision",
+        "canal": "telegram", "canal_id": "555",
+        "invoice_json": envelope.model_dump_json(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_aprobar_avisa_a_anb_que_se_envio_con_total(monkeypatch):
+    sent, _, _ = _patch_common(monkeypatch)
+    monkeypatch.setattr(main.sheets_client, "get_fiscal_rules", lambda *a, **kw: REGLAS)
+    monkeypatch.setattr(main.sheets_client, "get_pending", lambda invoice_id: _pending_anb(_draft("78101803")))
+    monkeypatch.setattr(main.sheets_client, "get_client_by_canal_id", lambda canal, cid: CLIENT_PROFILE)
+    monkeypatch.setattr(main.sheets_client, "update_pending_status", lambda *a, **kw: None)
+
+    msg = await main._execute_approval("aprobar", "inv-9")
+
+    assert "Enviada a Sin Culpa" in msg
+    assert "$1,160.00" in msg
+    assert (main.ALEJANDRO_CHAT_ID, msg, None) in sent
+
+
+@pytest.mark.asyncio
+async def test_aprobar_avisa_a_anb_si_falla_el_recalculo(monkeypatch):
+    sent, _, _ = _patch_common(monkeypatch)
+
+    def boom(*a, **kw):
+        raise RuntimeError("Supabase caído")
+    monkeypatch.setattr(main.sheets_client, "get_fiscal_rules", boom)
+    monkeypatch.setattr(main.sheets_client, "get_pending", lambda invoice_id: _pending_anb(_draft("78101803")))
+    monkeypatch.setattr(main.sheets_client, "get_client_by_canal_id", lambda canal, cid: CLIENT_PROFILE)
+    monkeypatch.setattr(main.sheets_client, "update_pending_status", lambda *a, **kw: None)
+
+    msg = await main._execute_approval("aprobar", "inv-9")
+
+    assert msg.startswith("🔴 No se envió a Sin Culpa")
+    assert "Supabase caído" in msg
+
+
+@pytest.mark.asyncio
+async def test_revision_de_anb_trae_detalle_completo_de_la_factura(monkeypatch):
+    sent, _, _ = _patch_common(monkeypatch)
+    monkeypatch.setattr(main.sheets_client, "get_fiscal_rules", lambda *a, **kw: REGLAS)
+
+    draft = InvoiceDraft(
+        estatus="confirmado_por_cliente", receptor=RECEPTOR_INCONGRUENTE,
+        factura=FacturaDraft(
+            conceptos=[ConceptoDraft(
+                descripcion="Asesoría <fiscal> & contable", cantidad=2, clave_unidad="E48",
+                precio_unitario=1000.0, clave_prod_serv="78101803",
+            )],
+            metodo_pago="PUE", forma_pago="03",
+        ),
+    )
+    await main._calcular_y_procesar_factura("inv-4", draft, CLIENT_PROFILE, "555", 1)
+
+    texto = next(text for cid, text, _ in sent if cid == main.ALEJANDRO_CHAT_ID)
+    assert "EMP010101AA1" in texto
+    assert "Asesoría &lt;fiscal&gt; &amp; contable" in texto  # escapado para HTML de Telegram
+    assert "2 E48 × $1,000.00 = $2,000.00" in texto
+    assert "IVA: $320.00" in texto
+    assert "<b>Total: $2,320.00</b>" in texto
+
+
+def test_monto_maximo_default_es_50k():
+    assert main.fiscal_engine.FiscalRules(
+        iva_aplica=True, tasa_iva=Decimal("0.16"),
+        retencion_iva_tasa=Decimal("0"), retencion_isr_tasa=Decimal("0"),
+        ieps_tasa=Decimal("0"), claves_con_ieps=frozenset(),
+    ).monto_maximo_sin_autorizacion == Decimal("50000")

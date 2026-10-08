@@ -22,7 +22,12 @@ TELEGRAM_WEBHOOK_SECRET = os.environ["TELEGRAM_WEBHOOK_SECRET"]
 ALEJANDRO_CHAT_ID = int(os.environ["ALEJANDRO_CHAT_ID"])
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-ANTHROPIC_MODEL = "claude-sonnet-4-6"
+# Haiku 5.5 (oct 2026): ~17x más barato que Sonnet 4.6 con la misma exactitud
+# en la batería de escenarios reales (20/21 vs 14/14; el único error fue una
+# clave marcada NUEVA, que escala a ANB en vez de timbrar mal). Para regresar
+# a Sonnet sin tocar código: ANTHROPIC_MODEL=claude-sonnet-4-6 en Railway.
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-5-5")
+ANTHROPIC_EFFORT = os.environ.get("ANTHROPIC_EFFORT", "low")
 
 FACTURAPI_BASE_URL = "https://www.facturapi.io/v2"
 

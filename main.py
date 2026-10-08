@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import logging
 import uuid
@@ -278,7 +279,7 @@ async def _calcular_y_procesar_factura(
     chat_id: str,
     message_id: int,
     omitir_validacion_cruzada: bool = False,
-) -> None:
+) -> Optional[InvoiceData]:
     """
     Calcula la factura con fiscal_engine y decide la ruta:
     - clave_prod_serv nueva sin aprobar -> escalar a ANB.
@@ -288,6 +289,9 @@ async def _calcular_y_procesar_factura(
     omitir_validacion_cruzada=True SOLO cuando ANB ya aprobó una escalación
     por VALIDACION_ARITMETICA y se está recalculando tras esa aprobación
     (ver _execute_approval). Nunca se activa desde el flujo normal.
+
+    Devuelve el InvoiceData si se envió al cliente para confirmación, o None
+    si se escaló a ANB o hubo un error (ambos ya avisan por su cuenta).
     """
     if not omitir_validacion_cruzada:
         claves_nuevas = [c for c in draft.factura.conceptos if c.clave_prod_serv == tools.CLAVE_NUEVA]
@@ -302,7 +306,7 @@ async def _calcular_y_procesar_factura(
                 invoice_draft=draft,
             )
             await _escalar_a_anb(invoice_id, chat_id, message_id, client_profile, envelope)
-            return
+            return None
 
     try:
         reglas = await asyncio.to_thread(
@@ -315,7 +319,7 @@ async def _calcular_y_procesar_factura(
             ALEJANDRO_CHAT_ID,
             f"🔴 {client_profile.nombre_comercial} no tiene reglas fiscales vigentes en Supabase: {exc}"
         )
-        return
+        return None
 
     conceptos_extraidos = [
         fiscal_engine.ConceptoExtraido(
@@ -346,15 +350,91 @@ async def _calcular_y_procesar_factura(
             escalation_detail=resultado.escalation.detail,
             invoice_draft=draft,
         )
-        await _escalar_a_anb(invoice_id, chat_id, message_id, client_profile, envelope)
-        return
+        # Montos tal como quedarían si ANB aprueba, para que la revisión
+        # traiga el detalle completo (mismo cálculo que hace la aprobación,
+        # sin los chequeos de consistencia).
+        vista_previa = fiscal_engine.calcular_factura(
+            conceptos_extraidos, draft.receptor, reglas,
+            draft.factura.metodo_pago, draft.factura.forma_pago,
+            omitir_validacion_cruzada=True,
+        ).factura
+        await _escalar_a_anb(invoice_id, chat_id, message_id, client_profile, envelope, vista_previa)
+        return None
 
     invoice_data = _build_invoice_data(draft, client_profile, resultado.factura)
     await _solicitar_confirmacion_cliente(invoice_id, invoice_data, client_profile, chat_id, message_id)
+    return invoice_data
+
+
+MAX_CONCEPTOS_EN_REVISION = 25  # Telegram corta mensajes de más de 4096 caracteres
+
+
+def _detalle_para_revision(
+    envelope: PendingPayload, vista_previa: Optional[fiscal_engine.FacturaCalculada]
+) -> str:
+    """Detalle completo de la solicitud para el mensaje de revisión de ANB (HTML)."""
+    e = html.escape
+    if envelope.tipo == "rep":
+        rep = envelope.rep_draft
+        r = rep.receptor
+        return "\n".join([
+            f"<b>Receptor:</b> {e(r.razon_social)}",
+            f"RFC {e(r.rfc)} · Régimen {e(r.regimen_fiscal)} · CP {e(r.cp_fiscal)}",
+            f"<b>Factura origen:</b> {e(rep.uuid_factura_origen)}",
+            f"<b>Fecha de pago:</b> {e(rep.fecha_pago)} · Forma de pago {e(rep.forma_pago)}",
+            f"<b>Monto pagado:</b> ${rep.monto_pagado:,.2f}",
+        ])
+
+    draft = envelope.invoice_draft
+    r = draft.receptor
+    f = draft.factura
+    lineas = [
+        f"<b>Receptor:</b> {e(r.razon_social)}",
+        f"RFC {e(r.rfc)} · Régimen {e(r.regimen_fiscal)} · CP {e(r.cp_fiscal)} · Uso {e(r.uso_cfdi)}",
+        f"<b>Método/forma de pago:</b> {e(f.metodo_pago)} / {e(f.forma_pago)}",
+        "",
+        f"<b>Conceptos ({len(f.conceptos)}):</b>",
+    ]
+    for c in f.conceptos[:MAX_CONCEPTOS_EN_REVISION]:
+        clave = c.clave_prod_serv
+        if clave == tools.CLAVE_NUEVA:
+            clave = f"NUEVA → {c.clave_prod_serv_propuesta}"
+        importe = Decimal(str(c.cantidad)) * Decimal(str(c.precio_unitario))
+        lineas.append(
+            f"• {e(c.descripcion)}\n"
+            f"   {c.cantidad:g} {e(c.clave_unidad)} × ${c.precio_unitario:,.2f} = ${importe:,.2f} · Clave {e(clave)}"
+        )
+    if len(f.conceptos) > MAX_CONCEPTOS_EN_REVISION:
+        lineas.append(f"… y {len(f.conceptos) - MAX_CONCEPTOS_EN_REVISION} conceptos más")
+    lineas.append("")
+
+    if vista_previa is not None:
+        v = vista_previa
+        lineas.append(f"Subtotal: ${v.subtotal:,.2f}")
+        if v.ieps > 0:
+            lineas.append(f"IEPS: ${v.ieps:,.2f}")
+        lineas.append(f"IVA: ${v.iva:,.2f}")
+        if v.retencion_iva > 0:
+            lineas.append(f"Retención IVA: -${v.retencion_iva:,.2f}")
+        if v.retencion_isr > 0:
+            lineas.append(f"Retención ISR: -${v.retencion_isr:,.2f}")
+        lineas.append(f"<b>Total: ${v.total:,.2f}</b>")
+    else:
+        subtotal = sum(
+            (Decimal(str(c.cantidad)) * Decimal(str(c.precio_unitario)) for c in f.conceptos),
+            Decimal("0"),
+        )
+        lineas.append(f"Subtotal: ${subtotal:,.2f} (los impuestos se calculan al aprobar)")
+    if f.total_documento_fuente is not None:
+        lineas.append(f"Total en el documento fuente: ${f.total_documento_fuente:,.2f}")
+    if f.observaciones:
+        lineas.append(f"Observaciones: {e(f.observaciones)}")
+    return "\n".join(lineas)
 
 
 async def _escalar_a_anb(
-    invoice_id: str, chat_id: str, message_id: int, client_profile, envelope: PendingPayload
+    invoice_id: str, chat_id: str, message_id: int, client_profile, envelope: PendingPayload,
+    vista_previa: Optional[fiscal_engine.FacturaCalculada] = None,
 ) -> None:
     await asyncio.to_thread(
         sheets_client.save_pending,
@@ -374,9 +454,10 @@ async def _escalar_a_anb(
     await telegram_client.send_message(
         ALEJANDRO_CHAT_ID,
         f"📋 {tipo_texto} pendiente de revisión\n"
-        f"Cliente: {client_profile.nombre_comercial}\n"
+        f"Cliente: {html.escape(client_profile.nombre_comercial)}\n"
         f"ID: {invoice_id}\n"
-        f"Motivo: [{envelope.escalation_reason}] {envelope.escalation_detail}\n\n"
+        f"Motivo: [{envelope.escalation_reason}] {html.escape(envelope.escalation_detail)}\n\n"
+        f"{_detalle_para_revision(envelope, vista_previa)}\n\n"
         f"/aprobar {invoice_id}\n/rechazar {invoice_id}",
         reply_markup={"inline_keyboard": [[
             {"text": "✅ Aprobar", "callback_data": f"aprobar:{invoice_id}"},
@@ -862,11 +943,28 @@ async def _execute_approval(command: str, invoice_id: str) -> str:
         omitir_validacion = False  # ya no hay "NUEVA" en el draft, no hace falta omitir nada
 
     await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⏳ Recalculando {invoice_id}...")
-    await _calcular_y_procesar_factura(
-        nuevo_invoice_id, draft, client_profile, client_canal_id, 0,
-        omitir_validacion_cruzada=omitir_validacion,
-    )
-    return f"Recalculando {invoice_id}..."
+    try:
+        invoice_data = await _calcular_y_procesar_factura(
+            nuevo_invoice_id, draft, client_profile, client_canal_id, 0,
+            omitir_validacion_cruzada=omitir_validacion,
+        )
+    except Exception as exc:
+        logger.exception("Error recalculando %s tras aprobación", invoice_id)
+        msg = f"🔴 No se envió a {client_profile.nombre_comercial}: error al recalcular {invoice_id}: {exc}"
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+        return msg
+
+    if invoice_data is None:
+        # Se volvió a escalar o faltaron reglas fiscales: el aviso con el
+        # motivo ya se mandó desde _calcular_y_procesar_factura.
+        msg = f"⚠️ No se envió a {client_profile.nombre_comercial} (ver mensaje anterior)."
+    else:
+        msg = (
+            f"✅ Enviada a {client_profile.nombre_comercial} para confirmación.\n"
+            f"Total: ${invoice_data.factura.total_estimado:,.2f}"
+        )
+    await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+    return msg
 
 
 async def handle_approval_command(chat_id: str, message_id: int, text: str) -> None:

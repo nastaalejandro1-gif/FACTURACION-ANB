@@ -66,6 +66,17 @@ def _content_from_serializable(raw: str):
     return raw
 
 
+# Reemplazo del archivo al guardar el historial. Debe ser neutro respecto al
+# tipo de documento: antes decía "[CSF adjunta — datos extraídos]" también
+# para cotizaciones y CFDIs, y Claude Haiku 5.5, al ver "CSF" donde estaba la
+# cotización, concluía que no la había leído y se negaba a generar la factura.
+PLACEHOLDER_ARCHIVO = (
+    "[El cliente adjuntó aquí un archivo (PDF o imagen). Ya lo leíste cuando lo "
+    "mandó; los datos que extrajiste de él están en tu respuesta siguiente y son "
+    "válidos. El archivo ya no se conserva en el historial para ahorrar espacio.]"
+)
+
+
 def strip_binary_from_messages(messages: list) -> list:
     cleaned = []
     for msg in messages:
@@ -75,7 +86,7 @@ def strip_binary_from_messages(messages: list) -> list:
             for block in content:
                 block_dict = block.model_dump() if hasattr(block, "model_dump") else block
                 if isinstance(block_dict, dict) and block_dict.get("type") in ("image", "document"):
-                    new_blocks.append({"type": "text", "text": "[CSF adjunta — datos extraídos]"})
+                    new_blocks.append({"type": "text", "text": PLACEHOLDER_ARCHIVO})
                 else:
                     new_blocks.append(block_dict)
             cleaned.append({"role": msg["role"], "content": new_blocks})
@@ -490,5 +501,5 @@ def get_fiscal_rules(despacho_id: str, id_cliente: str) -> FiscalRules:
         retencion_isr_tasa=Decimal(str(row["retencion_isr_tasa"])),
         ieps_tasa=Decimal(str(row["ieps_tasa"])),
         claves_con_ieps=claves_con_ieps,
-        monto_maximo_sin_autorizacion=Decimal(str(row.get("monto_maximo_sin_autorizacion") or "100000")),
+        monto_maximo_sin_autorizacion=Decimal(str(row.get("monto_maximo_sin_autorizacion") or "50000")),
     )

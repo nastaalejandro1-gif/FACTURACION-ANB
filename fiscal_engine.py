@@ -57,7 +57,7 @@ class FiscalRules:
     # Facturas por encima de esto -> EscalationReason.MONTO_ALTO. Default
     # solo para no romper construcciones existentes (tests, etc.) — el
     # valor real siempre viene de reglas_fiscales_cliente.
-    monto_maximo_sin_autorizacion: Decimal = Decimal("100000")
+    monto_maximo_sin_autorizacion: Decimal = Decimal("50000")
 
 
 # ---------------------------------------------------------------------------
@@ -194,15 +194,6 @@ def calcular_factura(
     ieps_total = sum((cc.ieps for cc in conceptos_calculados), Decimal("0.00"))
     iva = iva_total
 
-    if not omitir_validacion_cruzada and total_documento_fuente is not None and abs(subtotal - total_documento_fuente) > CENTAVO:
-        return FiscalCalculationResult(escalation=EscalationDetail(
-            reason=EscalationReason.VALIDACION_ARITMETICA,
-            detail=(
-                f"El total del documento fuente (${total_documento_fuente}) no coincide "
-                f"con la suma de los conceptos extraídos (${subtotal})."
-            ),
-        ))
-
     if tipo_persona == "PM":
         retencion_iva_tasa = reglas.retencion_iva_tasa
         retencion_isr_tasa = reglas.retencion_isr_tasa
@@ -216,6 +207,24 @@ def calcular_factura(
         retencion_isr = Decimal("0.00")
 
     total = subtotal + ieps_total + iva - retencion_iva - retencion_isr
+
+    # El "TOTAL" impreso en una cotización puede ser el subtotal (sin IVA),
+    # el total con impuestos trasladados, o el neto ya con retenciones. Los
+    # tres son válidos; solo se escala si no coincide con NINGUNO (concepto
+    # faltante o mal extraído). Antes se comparaba solo contra el subtotal y
+    # escalaba cualquier documento cuyo total incluía IVA.
+    if not omitir_validacion_cruzada and total_documento_fuente is not None:
+        total_con_traslados = subtotal + ieps_total + iva
+        candidatos = (subtotal, total_con_traslados, total)
+        if all(abs(c - total_documento_fuente) > CENTAVO for c in candidatos):
+            return FiscalCalculationResult(escalation=EscalationDetail(
+                reason=EscalationReason.VALIDACION_ARITMETICA,
+                detail=(
+                    f"El total del documento fuente (${total_documento_fuente}) no coincide "
+                    f"con lo calculado de los conceptos extraídos: subtotal ${subtotal}, "
+                    f"total con impuestos ${total_con_traslados}, total neto ${total}."
+                ),
+            ))
 
     # Decisión de negocio de ANB (no fiscal): facturas por encima de un
     # monto requieren su autorización antes de pasar a confirmación del
