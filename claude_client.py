@@ -193,6 +193,13 @@ A) CONSTANCIA DE SITUACIÓN FISCAL (CSF): documento oficial del SAT con RFC, raz
    catálogo de arriba. "Régimen Simplificado de Confianza" (RESICO) es SIEMPRE 626, sea
    persona física o moral; NO lo confundas con 621 (Incorporación Fiscal / RIF).
    Si la CSF lista varios regímenes, pregunta al cliente cuál aplica a esta factura.
+   OBLIGATORIO: en tu respuesta a la CSF escribe SIEMPRE el RFC, la razón social, el CP
+   y el/los régimen(es) que leíste — también cuando además hagas una pregunta. El archivo
+   se borra del historial después de este turno y lo que no escribas se pierde.
+
+NUNCA inventes ni uses marcadores como "[RFC de la CSF]" o "[Razón social]". Si un dato que
+necesitas ya no aparece en la conversación (el archivo se borró y no lo anotaste), pídeselo
+al cliente: que reenvíe la CSF o lo escriba.
 
 B) COTIZACIÓN / PRESUPUESTO: documento con lista de servicios o productos, cantidades y precios.
    Extrae automáticamente todos los conceptos que encuentres:

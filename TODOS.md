@@ -79,6 +79,11 @@ clasifica, el código calcula (Decimal, tolerancia cero). Migrado a producción 
       "RESICO PM"; oficialmente 621 = RIF y 626 = RESICO para PF y PM. Claude mapeaba CSFs de
       RESICO PF a 621 (caso real: factura de Envoy a POAA980325TIA salió con 621). Corregido el
       catálogo, la restricción PF/PM de 626, 616 y 622, y se agregaron 615/620/623/624.
+- [x] **CSF con 2 regímenes perdía RFC/razón social/CP** (9 oct 2026) — caso real de Envoy:
+      el bot preguntaba "¿cuál régimen?" sin escribir los datos; el PDF se borra del historial
+      al guardar y en el turno siguiente inventaba "[RFC de la CSF]". Reproducido con la config
+      de producción (Sonnet 4.6) 0/5; con la regla nueva en el prompt (escribir siempre los
+      datos de la CSF + nunca usar marcadores) 5/5 en Sonnet 4.6 y Haiku 5.5.
 - [ ] **Organización de Sin Culpa en FacturAPI con régimen 601** — Andrea Lozano es PF (RFC
       de 13) y su retención ISR 1.25% indica RESICO → debe ser 626. 601 es exclusivo de PM; en
       live el SAT lo rechazaría. Corregir en el dashboard de FacturAPI ANTES de pasar a live.
