@@ -119,3 +119,21 @@ clasifica, el código calcula (Decimal, tolerancia cero). Migrado a producción 
 - [ ] Formulario de onboarding web para nuevos despachos
 - [ ] Integración WhatsApp Business (canal dominante en MX profesional)
 - [ ] Suscripción vía Stripe
+
+## REP de facturas hechas en otro programa (oct 2026) — código listo, falta push
+
+Caso real: un cliente pidió REP de una factura timbrada en otro sistema y el bot se quedaba
+en "no se encontró el UUID en FacturAPI". Ahora (sin tablas nuevas en Supabase):
+- UUID no está en FacturAPI → el bot pide el XML (pendiente `esperando_xml_origen` en la tabla
+  `pendientes` existente). Al llegar el XML (`cfdi_xml.py`, lectura determinista) se retoma el
+  REP solo; los datos de la factura viajan dentro del pendiente. El receptor sale del CFDI.
+- Cada REP de una factura externa pide su XML (no se guarda en Supabase). Si el cliente lo
+  manda antes de pedir el REP, se recuerda 24h en memoria del proceso.
+- Parcialidad de REPs siguientes: se lee del último REP del bot en FacturAPI (`installment`).
+- Bloquea (avisa al cliente y a ANB para timbrar a mano): factura de otro emisor, PUE, moneda
+  ≠ MXN, IVA Exento/Cuota, total que no cuadra (impuestos locales).
+- Solo PDF → Claude lo lee y el REP va SIEMPRE a revisión de ANB (le llega el PDF).
+- Se asume primer pago; el cliente tiene botón "Ya hubo pagos antes" → ANB aprueba con
+  `/aprobar {id} saldo=... parcialidad=N`.
+- [x] Probado en sandbox: FacturAPI timbra el REP de un UUID que no conoce, prorrateo OK.
+- [ ] Pendiente futuro: soportar IVA Exento en el documento relacionado (FacturAPI acepta `factor`).

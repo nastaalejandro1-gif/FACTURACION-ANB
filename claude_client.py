@@ -254,6 +254,9 @@ Cuando el cliente manda un CFDI (PDF de factura con folio fiscal UUID) avisando 
    TI, el cliente, con el resumen del REP para que confirmes):
    "¡Listo! En un momento te mando el resumen del complemento de pago para que lo confirmes
    antes de timbrarlo. 📊"
+6. Facturas hechas en otro programa SÍ admiten REP. Si la factura no está en el sistema, el
+   sistema le pide el XML al cliente por su cuenta — tú no lo pidas ni digas que no se puede.
+   Cuando el cliente manda un XML, te llega una nota "[Sistema: ...]" con sus datos: úsalos.
 
 VARIOS PEDIDOS EN EL MISMO MENSAJE:
 Si el cliente junta más de un pedido (ej. "te aviso que pagaron la factura X, y además
@@ -487,3 +490,89 @@ def run_conversation_turn(
     # Exceeded MAX_TOOL_CYCLES without resolution
     logger.error("Se alcanzó el límite de ciclos tool_use sin resolución")
     return "Hubo un problema procesando tu solicitud. Por favor contacta al despacho.", None, None
+
+
+# ---------------------------------------------------------------------------
+# Factura origen externa en PDF (el cliente no tiene el XML)
+# ---------------------------------------------------------------------------
+
+_TOOL_FACTURA_ORIGEN = {
+    "name": "registrar_factura_origen",
+    "description": "Registra los datos fiscales leídos del PDF de un CFDI 4.0.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "uuid": {"type": "string", "description": "Folio fiscal (UUID) del CFDI."},
+            "rfc_emisor": {"type": "string"},
+            "rfc_receptor": {"type": "string"},
+            "nombre_receptor": {"type": "string"},
+            "regimen_receptor": {"type": "string", "description": "Clave de 3 dígitos del régimen fiscal del receptor."},
+            "cp_receptor": {"type": "string", "description": "Código postal del domicilio fiscal del receptor."},
+            "metodo_pago": {"type": "string", "description": "PUE o PPD."},
+            "moneda": {"type": "string", "description": "Clave de moneda, ej. MXN."},
+            "total": {"type": "number"},
+            "impuestos": {
+                "type": "array",
+                "description": "Una línea por impuesto y tasa, con la base sobre la que se calculó.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tipo": {"type": "string", "enum": ["IVA", "ISR", "IEPS"]},
+                        "tasa": {"type": "number", "description": "Tasa decimal, ej. 0.16 o 0.0125."},
+                        "retencion": {"type": "boolean"},
+                        "base": {"type": "number"},
+                    },
+                    "required": ["tipo", "tasa", "retencion", "base"],
+                },
+            },
+        },
+        "required": [
+            "uuid", "rfc_emisor", "rfc_receptor", "nombre_receptor", "regimen_receptor",
+            "cp_receptor", "metodo_pago", "moneda", "total", "impuestos",
+        ],
+    },
+}
+
+
+def extraer_factura_origen_de_pdf(pdf_bytes: bytes) -> dict:
+    """
+    Lee el PDF de un CFDI con Claude y lo devuelve con la misma forma que
+    cfdi_xml.parse_cfdi_xml (fuente='pdf'). Lo extraído de un PDF NUNCA
+    se timbra sin que ANB lo revise — ver main._procesar_pdf_factura_origen.
+    """
+    response = client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=2048,
+        tools=[_TOOL_FACTURA_ORIGEN],
+        tool_choice={"type": "tool", "name": "registrar_factura_origen"},
+        messages=[{"role": "user", "content": [
+            build_file_content_block(pdf_bytes, "application/pdf"),
+            {"type": "text", "text": (
+                "Extrae los datos de este CFDI tal como aparecen impresos. No inventes ni "
+                "calcules nada que no esté en el documento; si un dato no aparece, déjalo vacío."
+            )},
+        ]}],
+    )
+    _log_uso_claude("extraccion_factura_origen_pdf", response)
+    datos = next(b for b in response.content if b.type == "tool_use").input
+    return {
+        "fuente": "pdf",
+        "uuid": str(datos.get("uuid", "")).strip().upper(),
+        "fecha": "",
+        "serie_folio": "",
+        "tipo_comprobante": "",
+        "metodo_pago": str(datos.get("metodo_pago", "")).upper(),
+        "moneda": str(datos.get("moneda", "")).upper(),
+        "total": str(datos.get("total", 0)),
+        "rfc_emisor": str(datos.get("rfc_emisor", "")).upper(),
+        "nombre_emisor": "",
+        "rfc_receptor": str(datos.get("rfc_receptor", "")).upper(),
+        "nombre_receptor": datos.get("nombre_receptor", ""),
+        "regimen_receptor": str(datos.get("regimen_receptor", "")),
+        "cp_receptor": str(datos.get("cp_receptor", "")),
+        "bases_impuestos": [
+            {"type": i["tipo"], "rate": str(i["tasa"]), "withholding": bool(i["retencion"]), "base": str(i["base"])}
+            for i in datos.get("impuestos", [])
+        ],
+        "advertencias": [],
+    }

@@ -2,6 +2,7 @@ import asyncio
 import html
 import json
 import logging
+import time
 import uuid
 from decimal import Decimal
 from typing import Optional
@@ -9,14 +10,17 @@ from typing import Optional
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
+import cfdi_xml
 import fiscal_engine
 import sheets_client
 import telegram_client
 import tools
-from claude_client import run_conversation_turn
+from claude_client import extraer_factura_origen_de_pdf, run_conversation_turn
 from config import ALEJANDRO_CHAT_ID, CRON_SECRET, TELEGRAM_WEBHOOK_SECRET
 from escalation import EscalationReason
-from facturapi_client import create_invoice, create_rep, download_pdf, download_xml, search_invoice_by_uuid
+from facturapi_client import (
+    create_invoice, create_rep, download_pdf, download_xml, get_invoice, search_invoice_by_uuid,
+)
 from models import (
     ConceptoItem,
     EmisorData,
@@ -24,6 +28,7 @@ from models import (
     InvoiceData,
     InvoiceDraft,
     PendingPayload,
+    ReceptorData,
     RepData,
     RepDraft,
 )
@@ -160,11 +165,27 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
         if message.get("document"):
             file_id = message["document"]["file_id"]
             mime = message["document"].get("mime_type", "application/octet-stream")
-            if mime == "application/pdf":
+            nombre_archivo = (message["document"].get("file_name") or "").lower()
+            if mime in ("application/xml", "text/xml") or nombre_archivo.endswith(".xml"):
+                xml_bytes = await telegram_client.get_file(file_id)
+                nota = await _procesar_xml_factura_origen(client_profile, chat_id, message_id, xml_bytes)
+                if nota is None:
+                    return
+                # XML registrado sin un REP esperándolo: Claude sigue la
+                # conversación sabiendo que esa factura ya está disponible.
+                user_text = f"{user_text}\n\n{nota}" if user_text else nota
+            elif mime == "application/pdf":
                 file_bytes = await telegram_client.get_file(file_id)
                 media_type = "application/pdf"
+                esperando = await asyncio.to_thread(sheets_client.get_pending_esperando_xml, chat_id)
+                if esperando and await _procesar_pdf_factura_origen(
+                    client_profile, chat_id, message_id, file_bytes, esperando
+                ):
+                    return
             else:
-                await telegram_client.send_message(chat_id, "Por favor envía la CSF como PDF o imagen (JPG/PNG).")
+                await telegram_client.send_message(
+                    chat_id, "Por favor envía el archivo como PDF, XML o imagen (JPG/PNG)."
+                )
                 return
 
         elif message.get("photo"):
@@ -369,6 +390,23 @@ async def _calcular_y_procesar_factura(
 MAX_CONCEPTOS_EN_REVISION = 25  # Telegram corta mensajes de más de 4096 caracteres
 
 
+def _detalle_factura_origen(origen: Optional[dict]) -> list[str]:
+    if not origen:
+        return []
+    e = html.escape
+    lineas = [
+        "",
+        f"<b>Factura origen (leída de {e(origen.get('fuente', ''))}):</b>",
+        f"Emisor {e(origen.get('rfc_emisor', ''))} · Método {e(origen.get('metodo_pago', ''))} · "
+        f"Moneda {e(origen.get('moneda', ''))}",
+        f"Total: ${Decimal(str(origen.get('total', 0))):,.2f}",
+    ]
+    for b in origen.get("bases_impuestos", []):
+        tipo = f"Ret. {b['type']}" if b["withholding"] else b["type"]
+        lineas.append(f"• {e(tipo)} {e(str(b['rate']))} sobre base ${Decimal(str(b['base'])):,.2f}")
+    return lineas
+
+
 def _detalle_para_revision(
     envelope: PendingPayload, vista_previa: Optional[fiscal_engine.FacturaCalculada]
 ) -> str:
@@ -383,6 +421,7 @@ def _detalle_para_revision(
             f"<b>Factura origen:</b> {e(rep.uuid_factura_origen)}",
             f"<b>Fecha de pago:</b> {e(rep.fecha_pago)} · Forma de pago {e(rep.forma_pago)}",
             f"<b>Monto pagado:</b> ${rep.monto_pagado:,.2f}",
+            *_detalle_factura_origen(envelope.factura_origen),
         ])
 
     draft = envelope.invoice_draft
@@ -639,51 +678,252 @@ async def _timbre_and_deliver(
 # REP (Complemento de Pago)
 # ---------------------------------------------------------------------------
 
+# XML recibidos sin un REP esperándolos (el cliente mandó el XML antes de
+# pedir el REP). Solo en memoria: si el proceso se reinicia, el bot
+# simplemente vuelve a pedir el XML — no se guarda en Supabase.
+XML_RECIENTE_TTL_SEG = 24 * 3600
+_xml_recientes: dict[tuple[str, str], tuple[float, dict]] = {}
+
+
+def _guardar_xml_reciente(chat_id: str, origen: dict) -> None:
+    _xml_recientes[(chat_id, origen["uuid"])] = (time.monotonic(), origen)
+
+
+def _xml_reciente(chat_id: str, uuid_origen: str) -> Optional[dict]:
+    guardado = _xml_recientes.get((chat_id, uuid_origen.upper()))
+    if not guardado or time.monotonic() - guardado[0] > XML_RECIENTE_TTL_SEG:
+        return None
+    return guardado[1]
+
+
+def _es_externa(origen: dict) -> bool:
+    return origen.get("fuente") in ("xml", "pdf")
+
+
+def _saldo_anterior(origen: dict, previous_reps: list[dict]) -> Decimal:
+    """Último saldo insoluto timbrado por el bot; si no hay, el saldo que fijó
+    ANB por pagos hechos en otro programa; si tampoco, el total de la factura."""
+    if previous_reps:
+        return Decimal(str(previous_reps[-1].get("imp_saldo_insoluto") or 0))
+    return Decimal(str(origen.get("saldo_inicial") or origen.get("total", 0)))
+
+
+async def _num_parcialidad(origen: dict, previous_reps: list[dict], facturapi_key: str) -> int:
+    """
+    Número de esta parcialidad. Para facturas externas pueden existir pagos
+    timbrados en el otro programa, así que no basta contar los nuestros: se
+    toma la parcialidad del último REP del bot tal como quedó en FacturAPI
+    (fuente de verdad, sin guardar nada extra) o, si es el primero del bot,
+    las previas que fijó ANB. Los errores de red de FacturAPI se propagan.
+    """
+    if not _es_externa(origen):
+        return len(previous_reps) + 1
+    if not previous_reps:
+        return int(origen.get("parcialidades_previas", 0)) + 1
+    ultimo = await get_invoice(previous_reps[-1]["folio_fiscal"], facturapi_key)
+    docto = ultimo["complements"][0]["data"][0]["related_documents"][0]
+    return int(docto["installment"]) + 1
+
+
+def _receptor_de_origen(origen: dict, receptor_draft: ReceptorData) -> ReceptorData:
+    """El receptor de un REP debe ser el de la factura que liquida: para
+    facturas externas manda lo que dice el CFDI, no lo que juntó Claude."""
+    return ReceptorData(
+        razon_social=origen.get("nombre_receptor") or receptor_draft.razon_social,
+        rfc=origen.get("rfc_receptor") or receptor_draft.rfc,
+        regimen_fiscal=origen.get("regimen_receptor") or receptor_draft.regimen_fiscal,
+        cp_fiscal=origen.get("cp_receptor") or receptor_draft.cp_fiscal,
+        uso_cfdi="CP01",
+    )
+
+
+async def _pedir_xml_factura_origen(
+    invoice_id: str, draft: RepDraft, client_profile, chat_id: str, message_id: int
+) -> None:
+    """La factura no está en FacturAPI: se hizo en otro programa. Se deja el
+    REP esperando su XML (ver _procesar_xml_factura_origen)."""
+    await asyncio.to_thread(
+        sheets_client.save_pending,
+        invoice_id=invoice_id,
+        canal="telegram",
+        canal_id=chat_id,
+        telegram_message_id=message_id,
+        invoice_json=draft.model_dump_json(),
+        motivo_revision="esperando XML de factura origen externa",
+        tipo_aprobacion="esperando_xml_origen",
+        canal_id_aprobador=chat_id,
+    )
+    await telegram_client.send_message(
+        chat_id,
+        f"La factura {html.escape(draft.uuid_factura_origen)} no se hizo en este sistema, así que "
+        "para hacer su complemento de pago necesito el <b>XML</b> de esa factura. "
+        "Mándamelo por aquí como archivo. 📎\n\n"
+        "Si solo tienes el PDF, mándalo y el despacho revisará los datos antes de timbrar."
+    )
+    await telegram_client.send_message(
+        ALEJANDRO_CHAT_ID,
+        f"ℹ️ REP de factura externa: pedí el XML a {html.escape(client_profile.nombre_comercial)}\n"
+        f"UUID: {html.escape(draft.uuid_factura_origen)}\nMonto: ${draft.monto_pagado:,.2f}"
+    )
+
+
+async def _rechazar_factura_origen(
+    client_profile, chat_id: str, origen: dict, problemas: list[str], monto_pagado
+) -> None:
+    detalle = "\n".join(f"• {html.escape(p)}" for p in problemas)
+    await telegram_client.send_message(
+        chat_id,
+        "No puedo hacer este complemento de pago automáticamente:\n"
+        f"{detalle}\n\nEl despacho ya fue notificado y te contactará."
+    )
+    await telegram_client.send_message(
+        ALEJANDRO_CHAT_ID,
+        f"⚠️ REP de factura externa no procesable — {html.escape(client_profile.nombre_comercial)}\n"
+        f"UUID: {html.escape(origen.get('uuid', ''))} (fuente: {origen.get('fuente')})\n"
+        f"Monto pagado: ${Decimal(str(monto_pagado)):,.2f}\n{detalle}\n\n"
+        "Si procede, timbra el REP a mano en FacturAPI."
+    )
+
+
+async def _procesar_xml_factura_origen(
+    client_profile, chat_id: str, message_id: int, xml_bytes: bytes
+) -> Optional[str]:
+    """
+    XML de una factura emitida en otro programa. Si había un REP esperándolo
+    (ver _pedir_xml_factura_origen), lo retoma y devuelve None. Si no,
+    devuelve una nota para que Claude continúe la conversación (el cliente
+    pudo mandar el XML antes de pedir el REP). None también cuando el
+    archivo no sirve — ya se le avisó al cliente.
+    """
+    try:
+        origen = cfdi_xml.parse_cfdi_xml(xml_bytes)
+    except cfdi_xml.CfdiXmlError as exc:
+        await telegram_client.send_message(
+            chat_id,
+            f"No pude leer ese archivo como factura: {html.escape(str(exc))}\n"
+            "¿Me mandas el XML timbrado de la factura?"
+        )
+        return None
+    if origen["rfc_emisor"] != client_profile.rfc.upper():
+        await telegram_client.send_message(
+            chat_id,
+            f"Ese XML es de una factura emitida por {html.escape(origen['rfc_emisor'])}, no por "
+            f"{html.escape(client_profile.rfc)}. Solo puedo hacer complementos de pago de tus propias facturas."
+        )
+        return None
+
+    esperando = await asyncio.to_thread(sheets_client.get_pending_esperando_xml, chat_id)
+    if esperando:
+        draft = RepDraft.model_validate_json(esperando["invoice_json"])
+        if draft.uuid_factura_origen.upper() == origen["uuid"]:
+            await asyncio.to_thread(sheets_client.update_pending_status, esperando["id"], "xml_recibido")
+            await telegram_client.send_message(chat_id, "Recibí el XML de tu factura. ✅ Preparo el complemento de pago...")
+            await _calcular_y_timbrar_rep(
+                str(uuid.uuid4()), draft, client_profile, chat_id, message_id, origen_externo=origen
+            )
+            return None
+
+    _guardar_xml_reciente(chat_id, origen)
+    nota = (
+        f"[Sistema: el cliente envió el XML de su factura {origen['uuid']}"
+        f"{' (folio ' + origen['serie_folio'] + ')' if origen['serie_folio'] else ''}, emitida a "
+        f"{origen['nombre_receptor']} (RFC {origen['rfc_receptor']}), total ${Decimal(origen['total']):,.2f}, "
+        f"método {origen['metodo_pago']}. El sistema ya tiene sus datos: se le puede hacer complemento "
+        "de pago con generate_rep_draft usando ese UUID."
+    )
+    if esperando:
+        nota += (
+            " Ojo: hay un complemento de pago esperando el XML de OTRA factura ("
+            f"{RepDraft.model_validate_json(esperando['invoice_json']).uuid_factura_origen})."
+        )
+    return nota + "]"
+
+
+async def _procesar_pdf_factura_origen(
+    client_profile, chat_id: str, message_id: int, pdf_bytes: bytes, esperando: dict
+) -> bool:
+    """
+    Hay un REP esperando el XML y el cliente mandó un PDF. Si es esa factura,
+    Claude lee sus datos y el REP va SIEMPRE a revisión de ANB (un PDF no
+    da la certeza del XML). Devuelve False si el PDF no es esa factura (ej.
+    una cotización) para que siga la conversación normal.
+    """
+    draft = RepDraft.model_validate_json(esperando["invoice_json"])
+    try:
+        origen = await asyncio.to_thread(extraer_factura_origen_de_pdf, pdf_bytes)
+    except Exception:
+        logger.exception("No se pudo leer el PDF de factura origen para %s", chat_id)
+        return False
+    if origen["uuid"] != draft.uuid_factura_origen.upper():
+        return False
+
+    await asyncio.to_thread(sheets_client.update_pending_status, esperando["id"], "pdf_recibido")
+    problemas = cfdi_xml.problemas_para_rep(origen, client_profile.rfc)
+    if problemas:
+        await _rechazar_factura_origen(client_profile, chat_id, origen, problemas, draft.monto_pagado)
+        return True
+
+    draft = draft.model_copy(update={"receptor": _receptor_de_origen(origen, draft.receptor)})
+    envelope = PendingPayload(
+        tipo="rep",
+        escalation_reason=EscalationReason.FACTURA_ORIGEN_PDF.value,
+        escalation_detail=(
+            "factura hecha en otro programa; el cliente solo mandó el PDF y Claude leyó los datos. "
+            "Verifica total e impuestos contra el PDF (va abajo) antes de aprobar."
+        ),
+        rep_draft=draft,
+        factura_origen=origen,
+    )
+    await _escalar_a_anb(str(uuid.uuid4()), chat_id, message_id, client_profile, envelope)
+    await telegram_client.send_document(ALEJANDRO_CHAT_ID, pdf_bytes, "factura_origen.pdf")
+    return True
+
+
 async def _calcular_y_timbrar_rep(
     invoice_id: str, draft: RepDraft, client_profile, chat_id: str, message_id: int,
+    origen_externo: Optional[dict] = None,
 ) -> None:
     """
     Busca la factura original + REPs previos, calcula el saldo insoluto con
     fiscal_engine (fresco, justo antes de timbrar — evita depender de un
     cálculo viejo si llegaron más pagos mientras tanto), y timbra o escala.
+
+    origen_externo: factura hecha en otro programa, leída de su XML/PDF
+    (cfdi_xml.py). Sin ella, si FacturAPI no conoce el UUID se pide el XML
+    en vez de rendirse (ver _pedir_xml_factura_origen).
     """
-    facturapi_key = client_profile.facturapi_key if client_profile else ""
-
-    try:
-        original_invoice = await search_invoice_by_uuid(draft.uuid_factura_origen, facturapi_key)
-    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
-        logger.error("Error buscando factura origen %s: %s", draft.uuid_factura_origen, exc)
-        await telegram_client.send_message(
-            chat_id,
-            "Hubo un problema de conexión al buscar tu factura original. "
-            "El despacho ha sido notificado; vuelve a intentarlo en unos minutos."
-        )
-        await telegram_client.send_message(
-            ALEJANDRO_CHAT_ID,
-            f"⏱️ Error de red buscando UUID {draft.uuid_factura_origen} para REP\n"
-            f"Cliente: {client_profile.nombre_comercial}\n{type(exc).__name__}: {exc}"
-        )
-        return
+    original_invoice = origen_externo or _xml_reciente(chat_id, draft.uuid_factura_origen)
+    if original_invoice is None:
+        facturapi_key = client_profile.facturapi_key if client_profile else ""
+        try:
+            original_invoice = await search_invoice_by_uuid(draft.uuid_factura_origen, facturapi_key)
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            logger.error("Error buscando factura origen %s: %s", draft.uuid_factura_origen, exc)
+            await telegram_client.send_message(
+                chat_id,
+                "Hubo un problema de conexión al buscar tu factura original. "
+                "El despacho ha sido notificado; vuelve a intentarlo en unos minutos."
+            )
+            await telegram_client.send_message(
+                ALEJANDRO_CHAT_ID,
+                f"⏱️ Error de red buscando UUID {draft.uuid_factura_origen} para REP\n"
+                f"Cliente: {client_profile.nombre_comercial}\n{type(exc).__name__}: {exc}"
+            )
+            return
     if not original_invoice:
-        await telegram_client.send_message(
-            chat_id,
-            "No encontré la factura original en el sistema. El despacho revisará tu complemento de pago."
-        )
-        await telegram_client.send_message(
-            ALEJANDRO_CHAT_ID,
-            f"⚠️ REP: no se encontró UUID {draft.uuid_factura_origen} en FacturAPI\n"
-            f"Cliente: {client_profile.nombre_comercial}\nMonto: ${draft.monto_pagado:,.2f}"
-        )
+        await _pedir_xml_factura_origen(invoice_id, draft, client_profile, chat_id, message_id)
         return
 
-    invoice_total = Decimal(str(original_invoice.get("total", 0)))
+    externa = _es_externa(original_invoice)
+    if externa:
+        problemas = cfdi_xml.problemas_para_rep(original_invoice, client_profile.rfc)
+        if problemas:
+            await _rechazar_factura_origen(client_profile, chat_id, original_invoice, problemas, draft.monto_pagado)
+            return
+        draft = draft.model_copy(update={"receptor": _receptor_de_origen(original_invoice, draft.receptor)})
+
     previous_reps = await asyncio.to_thread(sheets_client.get_rep_history, draft.uuid_factura_origen)
-    if previous_reps:
-        imp_saldo_ant = Decimal(str(previous_reps[-1].get("imp_saldo_insoluto") or 0))
-        num_parcialidad = len(previous_reps) + 1
-    else:
-        imp_saldo_ant = invoice_total
-        num_parcialidad = 1
+    imp_saldo_ant = _saldo_anterior(original_invoice, previous_reps)
 
     resultado = fiscal_engine.calcular_rep(
         monto_pagado=Decimal(str(draft.monto_pagado)), imp_saldo_ant=imp_saldo_ant
@@ -695,6 +935,8 @@ async def _calcular_y_timbrar_rep(
             escalation_reason=resultado.escalation.reason.value,
             escalation_detail=resultado.escalation.detail,
             rep_draft=draft,
+            # sin esto, al aprobar ANB se volvería a pedir el XML
+            factura_origen=original_invoice if externa else None,
         )
         await _escalar_a_anb(invoice_id, chat_id, message_id, client_profile, envelope)
         return
@@ -708,12 +950,22 @@ async def _calcular_y_timbrar_rep(
         monto_pagado=resultado.rep.monto_pagado,
         imp_saldo_ant=resultado.rep.imp_saldo_ant,
         imp_saldo_insoluto=resultado.rep.imp_saldo_insoluto,
+        factura_origen_externa=original_invoice if externa else None,
     )
-    await _solicitar_confirmacion_cliente_rep(invoice_id, rep_data, client_profile, chat_id, message_id)
+    # Factura de otro programa sin pagos nuestros ni saldo fijado por ANB:
+    # se asumió primer pago (saldo = total). El cliente puede corregirlo.
+    supuso_primer_pago = (
+        externa and not previous_reps and not original_invoice.get("saldo_confirmado", False)
+    )
+    await _solicitar_confirmacion_cliente_rep(
+        invoice_id, rep_data, client_profile, chat_id, message_id,
+        ofrecer_pagos_previos=supuso_primer_pago,
+    )
 
 
 async def _solicitar_confirmacion_cliente_rep(
-    invoice_id: str, rep_data: RepData, client_profile, chat_id: str, message_id: int
+    invoice_id: str, rep_data: RepData, client_profile, chat_id: str, message_id: int,
+    ofrecer_pagos_previos: bool = False,
 ) -> None:
     await asyncio.to_thread(
         sheets_client.save_pending,
@@ -730,18 +982,26 @@ async def _solicitar_confirmacion_cliente_rep(
         "💳 Resumen de tu complemento de pago (REP):",
         "",
         f"Factura original: {rep_data.uuid_factura_origen}",
+        f"Cliente: {html.escape(rep_data.receptor.razon_social)} ({rep_data.receptor.rfc})",
         f"Monto pagado: ${rep_data.monto_pagado:,.2f}",
         f"Fecha de pago: {rep_data.fecha_pago}",
+        f"Saldo anterior: ${rep_data.imp_saldo_ant:,.2f}",
         f"Saldo insoluto después de este pago: ${rep_data.imp_saldo_insoluto:,.2f}",
-        "",
-        "¿Confirmas estos datos para timbrar el complemento de pago?",
     ]
+    teclado = [[
+        {"text": "✅ Sí, confirmar", "callback_data": f"cliente_si:{invoice_id}"},
+        {"text": "❌ No, corregir", "callback_data": f"cliente_no:{invoice_id}"},
+    ]]
+    if ofrecer_pagos_previos:
+        lineas += [
+            "",
+            "ℹ️ Tomé que este es el <b>primer pago</b> de esa factura. Si ya habías hecho "
+            "complementos de pago de ella en otro sistema, avísame con el botón de abajo.",
+        ]
+        teclado.append([{"text": "🔁 Ya hubo pagos antes", "callback_data": f"cliente_previos:{invoice_id}"}])
+    lineas += ["", "¿Confirmas estos datos para timbrar el complemento de pago?"]
     await telegram_client.send_message(
-        chat_id, "\n".join(lineas),
-        reply_markup={"inline_keyboard": [[
-            {"text": "✅ Sí, confirmar", "callback_data": f"cliente_si:{invoice_id}"},
-            {"text": "❌ No, corregir", "callback_data": f"cliente_no:{invoice_id}"},
-        ]]},
+        chat_id, "\n".join(lineas), reply_markup={"inline_keyboard": teclado},
     )
 
 
@@ -848,7 +1108,9 @@ async def _timbre_and_deliver_rep(
 # Aprobación de ANB (/aprobar, /rechazar) — solo para escalamientos
 # ---------------------------------------------------------------------------
 
-async def _execute_approval(command: str, invoice_id: str) -> str:
+async def _execute_approval(
+    command: str, invoice_id: str, saldo: Optional[Decimal] = None, parcialidad: Optional[int] = None,
+) -> str:
     """
     Ejecuta 'aprobar' o 'rechazar' de ANB sobre un escalamiento
     (tipo_aprobacion='anb_revision'). 'aprobar' NUNCA timbra directo: para
@@ -856,6 +1118,9 @@ async def _execute_approval(command: str, invoice_id: str) -> str:
     (la aprobación de ANB resuelve la inconsistencia, no reemplaza la
     confirmación del cliente). Para REP, sí puede timbrar directo si el
     recálculo ya no escala (no hay confirmación de cliente para REP).
+
+    saldo/parcialidad: solo para REP de factura externa con pagos previos en
+    otro programa (PAGOS_PREVIOS_EXTERNOS) — /aprobar {id} saldo=... parcialidad=...
     """
     pending = await asyncio.to_thread(sheets_client.get_pending, invoice_id)
     if not pending:
@@ -916,12 +1181,28 @@ async def _execute_approval(command: str, invoice_id: str) -> str:
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
         return msg
 
+    origen_externo = dict(envelope.factura_origen) if es_rep and envelope.factura_origen else None
+    if es_rep and envelope.escalation_reason == EscalationReason.PAGOS_PREVIOS_EXTERNOS.value:
+        if saldo is None or parcialidad is None or saldo <= 0 or parcialidad < 1 or not origen_externo:
+            msg = (
+                "Para este REP necesito el saldo antes de este pago y el número de parcialidad:\n"
+                f"/aprobar {invoice_id} saldo=12345.67 parcialidad=2"
+            )
+            await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+            return msg
+        origen_externo.update(
+            saldo_inicial=str(saldo), parcialidades_previas=parcialidad - 1, saldo_confirmado=True
+        )
+
     await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "aprobado")
     nuevo_invoice_id = str(uuid.uuid4())
 
     if es_rep:
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⏳ Reintentando REP {invoice_id}...")
-        await _calcular_y_timbrar_rep(nuevo_invoice_id, envelope.rep_draft, client_profile, client_canal_id, 0)
+        await _calcular_y_timbrar_rep(
+            nuevo_invoice_id, envelope.rep_draft, client_profile, client_canal_id, 0,
+            origen_externo=origen_externo,
+        )
         return f"Reintentando {invoice_id}..."
 
     draft = envelope.invoice_draft
@@ -982,7 +1263,16 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
 
     command = parts[0].lower().lstrip("/")
     invoice_id = parts[1]
-    await _execute_approval(command, invoice_id)
+    opciones = dict(p.split("=", 1) for p in parts[2:] if "=" in p)
+    try:
+        saldo = Decimal(opciones["saldo"].replace(",", "").lstrip("$")) if "saldo" in opciones else None
+        parcialidad = int(opciones["parcialidad"]) if "parcialidad" in opciones else None
+    except (ArithmeticError, ValueError):
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID, "Formato: /aprobar {id} saldo=12345.67 parcialidad=2"
+        )
+        return
+    await _execute_approval(command, invoice_id, saldo, parcialidad)
 
 
 # ---------------------------------------------------------------------------
@@ -1021,8 +1311,38 @@ async def _execute_client_confirmation(command: str, invoice_id: str, pending: d
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⚠️ No encontré el perfil del cliente para {invoice_id}.")
         return
 
-    await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "aprobado")
     message_id = int(pending.get("telegram_message_id") or 0)
+
+    if command == "cliente_previos":
+        # Factura de otro programa con pagos ya timbrados allá: el bot no
+        # puede saber el saldo real, lo fija ANB después de hablar con el cliente.
+        if not es_rep:
+            return
+        await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "pagos_previos")
+        nuevo_id = str(uuid.uuid4())
+        draft = RepDraft(
+            estatus="confirmado_por_cliente",
+            uuid_factura_origen=rep_data.uuid_factura_origen,
+            receptor=rep_data.receptor,
+            fecha_pago=rep_data.fecha_pago,
+            forma_pago=rep_data.forma_pago,
+            monto_pagado=float(rep_data.monto_pagado),
+        )
+        envelope = PendingPayload(
+            tipo="rep",
+            escalation_reason=EscalationReason.PAGOS_PREVIOS_EXTERNOS.value,
+            escalation_detail=(
+                "el cliente dice que ya hubo complementos de pago de esta factura en otro sistema. "
+                "Confirma con él el saldo antes de este pago y qué número de parcialidad es, y aprueba con "
+                f"/aprobar {nuevo_id} saldo=SALDO_ANTERIOR parcialidad=N"
+            ),
+            rep_draft=draft,
+            factura_origen=rep_data.factura_origen_externa,
+        )
+        await _escalar_a_anb(nuevo_id, chat_id, message_id, client_profile, envelope)
+        return
+
+    await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "aprobado")
 
     if es_rep:
         facturapi_key = client_profile.facturapi_key if client_profile else ""
@@ -1030,7 +1350,14 @@ async def _execute_client_confirmation(command: str, invoice_id: str, pending: d
         # justo antes de timbrar — el cliente pudo tardar en confirmar y
         # otro pago pudo haberse timbrado mientras tanto.
         try:
-            original_invoice = await search_invoice_by_uuid(rep_data.uuid_factura_origen, facturapi_key)
+            original_invoice = rep_data.factura_origen_externa or await search_invoice_by_uuid(
+                rep_data.uuid_factura_origen, facturapi_key
+            )
+            previous_reps = await asyncio.to_thread(sheets_client.get_rep_history, rep_data.uuid_factura_origen)
+            num_parcialidad = (
+                await _num_parcialidad(original_invoice, previous_reps, facturapi_key)
+                if original_invoice else 0
+            )
         except (httpx.HTTPStatusError, httpx.RequestError) as exc:
             await telegram_client.send_message(
                 chat_id,
@@ -1046,8 +1373,6 @@ async def _execute_client_confirmation(command: str, invoice_id: str, pending: d
                 ALEJANDRO_CHAT_ID, f"⚠️ No encontré la factura original al confirmar REP {invoice_id}."
             )
             return
-        previous_reps = await asyncio.to_thread(sheets_client.get_rep_history, rep_data.uuid_factura_origen)
-        num_parcialidad = len(previous_reps) + 1
         await _timbre_and_deliver_rep(
             invoice_id, rep_data, client_profile, chat_id, facturapi_key, num_parcialidad, original_invoice
         )
@@ -1070,7 +1395,7 @@ async def handle_callback_query(callback_query: dict) -> None:
         await _execute_approval(command, invoice_id)
         return
 
-    if command in ("cliente_si", "cliente_no"):
+    if command in ("cliente_si", "cliente_no", "cliente_previos"):
         if not invoice_id:
             await telegram_client.answer_callback_query(callback_id, "Acción inválida")
             return
@@ -1113,6 +1438,14 @@ async def check_pending(x_cron_secret: Optional[str] = Header(None)):
         tipo_aprobacion = str(row.get("tipo_aprobacion", "anb_revision"))
         canal_id = row.get("canal_id", "?")
         motivo = row.get("motivo_revision", "")
+
+        if tipo_aprobacion == "esperando_xml_origen":
+            await telegram_client.send_message(
+                ALEJANDRO_CHAT_ID,
+                f"ℹ️ El cliente (canal_id: {canal_id}) no ha mandado en más de 24h el XML de la "
+                f"factura externa para su REP ({invoice_id}). Puedes darle seguimiento manual."
+            )
+            continue
 
         if tipo_aprobacion == "cliente_confirmacion":
             # No son botones de ANB -- solo un aviso informativo, sin

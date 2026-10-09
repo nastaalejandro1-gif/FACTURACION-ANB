@@ -16,6 +16,9 @@ class EscalationReason(str, Enum):
     ERROR_TIMBRE_SAT = "error_timbre_sat"
     RFC_INVALIDO = "rfc_invalido"
     RECEPTOR_EXTRANJERO_SIN_RFC = "receptor_extranjero_sin_rfc"
+    FACTURA_ORIGEN_EXTERNA = "factura_origen_externa"  # REP de factura hecha en otro programa que no pasa las validaciones de cfdi_xml.problemas_para_rep
+    FACTURA_ORIGEN_PDF = "factura_origen_pdf"  # factura externa leída de PDF por Claude: ANB verifica los datos antes de timbrar
+    PAGOS_PREVIOS_EXTERNOS = "pagos_previos_externos"  # hubo parcialidades en el otro programa: ANB fija saldo y número de parcialidad
     MONTO_ALTO = "monto_alto"  # decisión de negocio de ANB, no fiscal — ver reglas_fiscales_cliente.monto_maximo_sin_autorizacion
 
 

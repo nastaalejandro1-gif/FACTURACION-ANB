@@ -361,6 +361,22 @@ def get_rep_history(uuid_factura_origen: str) -> list[dict]:
     return result.data or []
 
 
+def get_pending_esperando_xml(canal_id: str) -> Optional[dict]:
+    """El REP más reciente de este chat que quedó esperando el XML de su factura origen."""
+    sb = _get_supabase()
+    result = (
+        sb.table("pendientes")
+        .select("*")
+        .eq("canal_id", str(int(float(canal_id))))
+        .eq("tipo_aprobacion", "esperando_xml_origen")
+        .eq("estado", "pendiente")
+        .order("timestamp", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
 def log_to_bitacora(
     invoice_id: str,
     canal_id: str,

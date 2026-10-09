@@ -223,6 +223,10 @@ class RepData(BaseModel):
     monto_pagado: Decimal = Field(gt=0)
     imp_saldo_ant: Decimal = Field(ge=0)
     imp_saldo_insoluto: Decimal = Field(ge=0)
+    # Factura hecha en otro programa (leída de su XML/PDF, ver cfdi_xml.py).
+    # Viaja en el pendiente para que al confirmar no se busque en FacturAPI,
+    # que no la conoce.
+    factura_origen_externa: Optional[dict] = None
 
     @field_validator("forma_pago")
     @classmethod
@@ -295,6 +299,9 @@ class PendingPayload(BaseModel):
     escalation_detail: str
     invoice_draft: Optional[InvoiceDraft] = None
     rep_draft: Optional[RepDraft] = None
+    # Factura origen emitida fuera de FacturAPI (XML/PDF): sin ella, al
+    # aprobar ANB se volvería a pedir el archivo al cliente.
+    factura_origen: Optional[dict] = None
 
     @model_validator(mode="after")
     def validate_shape(self) -> "PendingPayload":

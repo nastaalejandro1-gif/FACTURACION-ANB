@@ -197,6 +197,15 @@ async def create_invoice(invoice_data: InvoiceData, facturapi_key: str) -> dict:
 
 
 @_facturapi_retry
+async def get_invoice(invoice_id: str, facturapi_key: str) -> dict:
+    headers = {"Authorization": f"Bearer {facturapi_key}"}
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        response = await client.get(f"{FACTURAPI_BASE_URL}/invoices/{invoice_id}", headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+
+@_facturapi_retry
 async def download_pdf(invoice_id: str, facturapi_key: str) -> bytes:
     headers = {"Authorization": f"Bearer {facturapi_key}"}
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -278,6 +287,13 @@ def _build_related_document_taxes(original_invoice: dict, monto_pagado: Decimal)
     proporcion = monto_pagado / invoice_total
 
     agregados: dict[tuple, Decimal] = {}  # (type, rate_str, withholding) -> base acumulada
+    # Factura emitida fuera de FacturAPI (leída de su XML, ver cfdi_xml.py):
+    # las bases ya vienen agregadas y exactas del propio CFDI, no hay items
+    # que reconstruir.
+    for b in original_invoice.get("bases_impuestos", []):
+        key = (b["type"], str(b["rate"]), bool(b["withholding"]))
+        agregados[key] = agregados.get(key, Decimal("0")) + Decimal(str(b["base"]))
+
     for item in original_invoice.get("items", []):
         info = item.get("product_info") or item.get("product") or {}
         item_taxes = info.get("taxes", [])
