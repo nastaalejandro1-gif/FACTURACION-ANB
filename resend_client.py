@@ -24,12 +24,10 @@ async def send_invoice_email(
         logger.warning("Cliente %s sin email_factura — email omitido", nombre_comercial)
         return
 
-    folio_short = folio[:8] if len(folio) > 8 else folio
-
     payload = {
         "from": RESEND_FROM_EMAIL,
         "to": [to_email],
-        "subject": f"Tu factura está lista — Folio {folio_short}",
+        "subject": f"Tu factura está lista — Folio {folio}",
         "html": f"""
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
             <h2 style="color: #2c3e50;">Tu factura está lista</h2>
@@ -47,11 +45,11 @@ async def send_invoice_email(
         """,
         "attachments": [
             {
-                "filename": f"factura_{folio_short}.pdf",
+                "filename": f"{folio}.pdf",
                 "content": base64.standard_b64encode(pdf_bytes).decode(),
             },
             {
-                "filename": f"factura_{folio_short}.xml",
+                "filename": f"{folio}.xml",
                 "content": base64.standard_b64encode(xml_bytes).decode(),
             },
         ],
@@ -65,7 +63,7 @@ async def send_invoice_email(
                 headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
             )
         if response.status_code in (200, 201):
-            logger.info("Email enviado a %s para folio %s", to_email, folio_short)
+            logger.info("Email enviado a %s para folio %s", to_email, folio)
         else:
             logger.error("Resend error %s: %s", response.status_code, response.text)
     except Exception:

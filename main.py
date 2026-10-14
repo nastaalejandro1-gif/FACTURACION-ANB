@@ -562,6 +562,15 @@ async def _solicitar_confirmacion_cliente(
     )
 
 
+def _nombre_archivo_cfdi(result: dict, prefijo: str, respaldo: str) -> str:
+    """Nombre de archivo con la serie y folio de FacturAPI (ej. "A-123"); si no vienen, el id interno."""
+    serie = "".join(c for c in str(result.get("series") or "") if c.isalnum() or c in "-_")
+    folio_numero = result.get("folio_number")
+    if folio_numero in (None, ""):
+        return f"{prefijo}_{respaldo[:8]}"
+    return f"{serie}-{folio_numero}" if serie else str(folio_numero)
+
+
 async def _timbre_and_deliver(
     invoice_id: str,
     invoice_data: InvoiceData,
@@ -649,17 +658,18 @@ async def _timbre_and_deliver(
         return
 
     # Éxito — entregar por Telegram y por email
+    nombre = _nombre_archivo_cfdi(result, "factura", invoice_id)
     await telegram_client.send_document(
-        chat_id, pdf_bytes, f"factura_{invoice_id[:8]}.pdf",
-        caption=f"✅ Tu factura ha sido timbrada. Folio: {folio}"
+        chat_id, pdf_bytes, f"{nombre}.pdf",
+        caption=f"✅ Tu factura ha sido timbrada. Folio: {nombre}"
     )
     await telegram_client.send_document(
-        chat_id, xml_bytes, f"factura_{invoice_id[:8]}.xml"
+        chat_id, xml_bytes, f"{nombre}.xml"
     )
     await send_invoice_email(
         to_email=client_profile.email_factura,
         nombre_comercial=client_profile.nombre_comercial,
-        folio=folio,
+        folio=nombre,
         pdf_bytes=pdf_bytes,
         xml_bytes=xml_bytes,
     )
@@ -1087,11 +1097,12 @@ async def _timbre_and_deliver_rep(
         )
         return
 
+    nombre = _nombre_archivo_cfdi(result, "rep", invoice_id)
     await telegram_client.send_document(
-        chat_id, pdf_bytes, f"rep_{invoice_id[:8]}.pdf",
-        caption=f"✅ Complemento de pago timbrado. Folio: {folio}"
+        chat_id, pdf_bytes, f"{nombre}.pdf",
+        caption=f"✅ Complemento de pago timbrado. Folio: {nombre}"
     )
-    await telegram_client.send_document(chat_id, xml_bytes, f"rep_{invoice_id[:8]}.xml")
+    await telegram_client.send_document(chat_id, xml_bytes, f"{nombre}.xml")
     await asyncio.to_thread(
         sheets_client.log_to_bitacora,
         invoice_id=invoice_id, canal_id=chat_id,
