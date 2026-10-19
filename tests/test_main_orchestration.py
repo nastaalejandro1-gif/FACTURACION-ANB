@@ -346,6 +346,71 @@ async def test_aprobar_avisa_a_anb_si_falla_el_recalculo(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_clave_nueva_ofrece_boton_de_clave_predeterminada(monkeypatch):
+    sent, _, _ = _patch_common(monkeypatch)
+
+    await main._calcular_y_procesar_factura("inv-1", _draft("NUEVA", "90111500"), CLIENT_PROFILE, "555", 1)
+
+    texto, markup = next((t, m) for cid, t, m in sent if cid == main.ALEJANDRO_CHAT_ID)
+    assert "/predeterminada inv-1" in texto
+    assert {"text": "🔁 Usar clave predeterminada (78101803)", "callback_data": "predeterminada:inv-1"} in [
+        b for fila in markup["inline_keyboard"] for b in fila
+    ]
+
+
+@pytest.mark.asyncio
+async def test_otras_revisiones_no_ofrecen_clave_predeterminada(monkeypatch):
+    sent, _, _ = _patch_common(monkeypatch)
+    monkeypatch.setattr(main.sheets_client, "get_fiscal_rules", lambda *a, **kw: REGLAS)
+    draft = _draft("78101803").model_copy(update={"receptor": RECEPTOR_INCONGRUENTE})
+
+    await main._calcular_y_procesar_factura("inv-2", draft, CLIENT_PROFILE, "555", 1)
+
+    texto, markup = next((t, m) for cid, t, m in sent if cid == main.ALEJANDRO_CHAT_ID)
+    assert "predeterminada" not in texto
+    assert "predeterminada" not in str(markup)
+
+
+@pytest.mark.asyncio
+async def test_predeterminada_usa_clave_del_cliente_y_no_la_guarda_en_catalogo(monkeypatch):
+    sent, saved_pending, _ = _patch_common(monkeypatch)
+    monkeypatch.setattr(main.sheets_client, "get_fiscal_rules", lambda *a, **kw: REGLAS)
+    monkeypatch.setattr(
+        main.sheets_client, "get_pending",
+        lambda invoice_id: _pending_anb(_draft("NUEVA", "90111500"), reason="clave_prod_serv_nueva"),
+    )
+    monkeypatch.setattr(main.sheets_client, "get_client_by_canal_id", lambda canal, cid: CLIENT_PROFILE)
+    estados = []
+    monkeypatch.setattr(main.sheets_client, "update_pending_status", lambda pid, estado: estados.append(estado))
+
+    def no_guardar(**kw):
+        raise AssertionError("la clave propuesta no debe guardarse en el catálogo")
+    monkeypatch.setattr(main.sheets_client, "save_clave_aprobada", no_guardar)
+
+    msg = await main._execute_approval("predeterminada", "inv-9")
+
+    assert "Enviada a Sin Culpa" in msg
+    assert estados == ["aprobado"]
+    # va al cliente para confirmación con la clave predeterminada
+    confirmacion = next(p for p in saved_pending if p["tipo_aprobacion"] == "cliente_confirmacion")
+    assert '"clave_prod_serv":"78101803"' in confirmacion["invoice_json"].replace(" ", "")
+
+
+@pytest.mark.asyncio
+async def test_predeterminada_no_aplica_a_otras_revisiones(monkeypatch):
+    sent, _, _ = _patch_common(monkeypatch)
+    monkeypatch.setattr(main.sheets_client, "get_pending", lambda invoice_id: _pending_anb(_draft("78101803")))
+    monkeypatch.setattr(main.sheets_client, "get_client_by_canal_id", lambda canal, cid: CLIENT_PROFILE)
+    estados = []
+    monkeypatch.setattr(main.sheets_client, "update_pending_status", lambda pid, estado: estados.append(estado))
+
+    msg = await main._execute_approval("predeterminada", "inv-9")
+
+    assert "solo aplica" in msg
+    assert estados == []  # sigue pendiente, puede aprobarse o rechazarse
+
+
+@pytest.mark.asyncio
 async def test_revision_de_anb_trae_detalle_completo_de_la_factura(monkeypatch):
     sent, _, _ = _patch_common(monkeypatch)
     monkeypatch.setattr(main.sheets_client, "get_fiscal_rules", lambda *a, **kw: REGLAS)

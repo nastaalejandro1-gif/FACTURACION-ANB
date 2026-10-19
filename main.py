@@ -100,7 +100,7 @@ async def process_update(update: dict) -> None:
 
         # Route commands
         text = message.get("text", "")
-        if text.startswith("/aprobar") or text.startswith("/rechazar"):
+        if text.startswith(("/aprobar", "/rechazar", "/predeterminada")):
             await handle_approval_command(chat_id, message_id, text)
             return
 
@@ -471,6 +471,27 @@ def _detalle_para_revision(
     return "\n".join(lineas)
 
 
+def _botones_revision_anb(invoice_id: str, motivo: str, clave_default: str) -> tuple[str, dict]:
+    """
+    Comandos y botones de la revisión de ANB. En una clave nueva se agrega
+    la tercera opción: no aprobar la propuesta y usar la clave predeterminada
+    del cliente.
+    """
+    comandos = f"/aprobar {invoice_id}\n/rechazar {invoice_id}"
+    fila = [
+        {"text": "✅ Aprobar", "callback_data": f"aprobar:{invoice_id}"},
+        {"text": "❌ Rechazar", "callback_data": f"rechazar:{invoice_id}"},
+    ]
+    teclado = [fila]
+    if motivo == EscalationReason.CLAVE_PROD_SERV_NUEVA.value and clave_default:
+        comandos += f"\n/predeterminada {invoice_id} (usar {clave_default})"
+        teclado.append([{
+            "text": f"🔁 Usar clave predeterminada ({clave_default})",
+            "callback_data": f"predeterminada:{invoice_id}",
+        }])
+    return comandos, {"inline_keyboard": teclado}
+
+
 async def _escalar_a_anb(
     invoice_id: str, chat_id: str, message_id: int, client_profile, envelope: PendingPayload,
     vista_previa: Optional[fiscal_engine.FacturaCalculada] = None,
@@ -490,6 +511,9 @@ async def _escalar_a_anb(
         "Tu solicitud está siendo revisada por el despacho. Te notificaremos en breve. ✅"
     )
     tipo_texto = "REP" if envelope.tipo == "rep" else "Factura"
+    comandos, teclado = _botones_revision_anb(
+        invoice_id, envelope.escalation_reason, client_profile.clave_prod_serv_default
+    )
     await telegram_client.send_message(
         ALEJANDRO_CHAT_ID,
         f"📋 {tipo_texto} pendiente de revisión\n"
@@ -497,11 +521,8 @@ async def _escalar_a_anb(
         f"ID: {invoice_id}\n"
         f"Motivo: [{envelope.escalation_reason}] {html.escape(envelope.escalation_detail)}\n\n"
         f"{_detalle_para_revision(envelope, vista_previa)}\n\n"
-        f"/aprobar {invoice_id}\n/rechazar {invoice_id}",
-        reply_markup={"inline_keyboard": [[
-            {"text": "✅ Aprobar", "callback_data": f"aprobar:{invoice_id}"},
-            {"text": "❌ Rechazar", "callback_data": f"rechazar:{invoice_id}"},
-        ]]},
+        f"{comandos}",
+        reply_markup=teclado,
     )
     await asyncio.to_thread(
         sheets_client.log_to_bitacora,
@@ -1130,6 +1151,10 @@ async def _execute_approval(
     confirmación del cliente). Para REP, sí puede timbrar directo si el
     recálculo ya no escala (no hay confirmación de cliente para REP).
 
+    'predeterminada': solo para CLAVE_PROD_SERV_NUEVA — en vez de la clave
+    propuesta usa la clave_prod_serv_default del cliente (sin guardarla en el
+    catálogo) y sigue igual que 'aprobar'.
+
     saldo/parcialidad: solo para REP de factura externa con pagos previos en
     otro programa (PAGOS_PREVIOS_EXTERNOS) — /aprobar {id} saldo=... parcialidad=...
     """
@@ -1192,6 +1217,21 @@ async def _execute_approval(
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
         return msg
 
+    usar_predeterminada = command == "predeterminada"
+    if usar_predeterminada:
+        clave_default = client_profile.clave_prod_serv_default
+        if envelope.escalation_reason != EscalationReason.CLAVE_PROD_SERV_NUEVA.value:
+            msg = f"/predeterminada solo aplica cuando el bot propone una clave nueva ({invoice_id} no es el caso)."
+            await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+            return msg
+        if not clave_default:
+            msg = (
+                f"{client_profile.nombre_comercial} no tiene clave predeterminada en Supabase "
+                "(clave_prod_serv_default). Usa /aprobar o /rechazar."
+            )
+            await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+            return msg
+
     origen_externo = dict(envelope.factura_origen) if es_rep and envelope.factura_origen else None
     if es_rep and envelope.escalation_reason == EscalationReason.PAGOS_PREVIOS_EXTERNOS.value:
         if saldo is None or parcialidad is None or saldo <= 0 or parcialidad < 1 or not origen_externo:
@@ -1218,7 +1258,16 @@ async def _execute_approval(
 
     draft = envelope.invoice_draft
     omitir_validacion = True
-    if envelope.escalation_reason == EscalationReason.CLAVE_PROD_SERV_NUEVA.value:
+    if usar_predeterminada:
+        # ANB rechaza la clave propuesta: se usa la del cliente y la
+        # propuesta NO se guarda en su catálogo de claves aprobadas.
+        draft = draft.model_copy(deep=True)
+        for c in draft.factura.conceptos:
+            if c.clave_prod_serv == tools.CLAVE_NUEVA:
+                c.clave_prod_serv = client_profile.clave_prod_serv_default
+                c.clave_prod_serv_propuesta = ""
+        omitir_validacion = False
+    elif envelope.escalation_reason == EscalationReason.CLAVE_PROD_SERV_NUEVA.value:
         draft = draft.model_copy(deep=True)
         for c in draft.factura.conceptos:
             if c.clave_prod_serv == tools.CLAVE_NUEVA and c.clave_prod_serv_propuesta:
@@ -1268,7 +1317,7 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
     if len(parts) < 2:
         await telegram_client.send_message(
             ALEJANDRO_CHAT_ID,
-            "Formato: /aprobar {id} o /rechazar {id}"
+            "Formato: /aprobar {id}, /rechazar {id} o /predeterminada {id}"
         )
         return
 
@@ -1397,7 +1446,7 @@ async def handle_callback_query(callback_query: dict) -> None:
     data = callback_query.get("data", "")
     command, _, invoice_id = data.partition(":")
 
-    if command in ("aprobar", "rechazar"):
+    if command in ("aprobar", "rechazar", "predeterminada"):
         if not chat_id or int(chat_id) != ALEJANDRO_CHAT_ID:
             logger.warning("Callback de aprobación de ANB de chat no autorizado: %s", chat_id)
             await telegram_client.answer_callback_query(callback_id)
@@ -1469,15 +1518,21 @@ async def check_pending(x_cron_secret: Optional[str] = Header(None)):
             )
             continue
 
+        # motivo_revision se guarda como "[razón] detalle" (ver _escalar_a_anb)
+        razon = motivo[1:].partition("]")[0] if motivo.startswith("[") else ""
+        clave_default = ""
+        if razon == EscalationReason.CLAVE_PROD_SERV_NUEVA.value:
+            perfil = await asyncio.to_thread(
+                sheets_client.get_client_by_canal_id, str(row.get("canal", "telegram")), str(canal_id)
+            )
+            clave_default = perfil.clave_prod_serv_default if perfil else ""
+        comandos, teclado = _botones_revision_anb(invoice_id, razon, clave_default)
         await telegram_client.send_message(
             ALEJANDRO_CHAT_ID,
             f"⚠️ Solicitud sin revisión hace más de 24h\n"
             f"ID: {invoice_id}\nCliente canal_id: {canal_id}\nMotivo: {motivo}\n\n"
-            f"/aprobar {invoice_id}\n/rechazar {invoice_id}",
-            reply_markup={"inline_keyboard": [[
-                {"text": "✅ Aprobar", "callback_data": f"aprobar:{invoice_id}"},
-                {"text": "❌ Rechazar", "callback_data": f"rechazar:{invoice_id}"},
-            ]]},
+            f"{comandos}",
+            reply_markup=teclado,
         )
 
     return {"checked": len(overdue)}
