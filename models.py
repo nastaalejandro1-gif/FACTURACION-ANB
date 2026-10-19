@@ -118,6 +118,22 @@ class RepDraft(BaseModel):
         return v
 
 
+MOTIVOS_CANCELACION = {
+    "02": "Comprobante emitido con errores sin relación",
+    "03": "No se llevó a cabo la operación",
+}
+
+
+class CancelacionDraft(BaseModel):
+    """
+    Solicitud de cancelación que extrae Claude. folio = id de FacturAPI tal
+    como está en bitácora (folio_fiscal). Motivo 01 (sustitución) no se
+    soporta: exige timbrar antes la factura que sustituye.
+    """
+    folio: str = Field(min_length=1)
+    motivo: Literal["02", "03"]
+
+
 # ---------------------------------------------------------------------------
 # Modelos finales — lo que produce fiscal_engine, listo para timbrar.
 # Todos los montos en Decimal. Los validadores de consistencia son EXACTOS

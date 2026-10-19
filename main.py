@@ -19,9 +19,12 @@ from claude_client import extraer_factura_origen_de_pdf, run_conversation_turn
 from config import ALEJANDRO_CHAT_ID, CRON_SECRET, TELEGRAM_WEBHOOK_SECRET
 from escalation import EscalationReason
 from facturapi_client import (
-    create_invoice, create_rep, download_pdf, download_xml, get_invoice, search_invoice_by_uuid,
+    cancel_invoice, create_invoice, create_rep, download_pdf, download_xml, get_invoice,
+    search_invoice_by_uuid,
 )
 from models import (
+    MOTIVOS_CANCELACION,
+    CancelacionDraft,
     ConceptoItem,
     EmisorData,
     FacturaData,
@@ -147,13 +150,18 @@ async def process_update(update: dict) -> None:
             pass
 
 
+# Facturas recientes que ve Claude: referencia para "otra igual" y lista de
+# las que el cliente puede cancelar por el bot.
+LIMITE_FACTURAS_RECIENTES = 10
+
+
 async def handle_conversation(client_profile, chat_id: str, message_id: int, message: dict) -> None:
     history = await asyncio.to_thread(sheets_client.load_history, chat_id)
     catalogo = await asyncio.to_thread(
         sheets_client.get_catalogo_claves, client_profile.despacho_id, client_profile.id_cliente
     )
     facturas_recientes = await asyncio.to_thread(
-        sheets_client.get_facturas_recientes, client_profile.despacho_id, chat_id
+        sheets_client.get_facturas_recientes, client_profile.despacho_id, chat_id, LIMITE_FACTURAS_RECIENTES
     )
 
     # Extract text and/or file
@@ -200,7 +208,7 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
 
         # En hilo aparte: la llamada a Claude tarda segundos (PDFs: hasta un minuto)
         # y bloquearía el procesamiento de TODOS los demás clientes.
-        client_message, invoice_draft, rep_draft = await asyncio.to_thread(
+        client_message, invoice_draft, rep_draft, cancelacion = await asyncio.to_thread(
             run_conversation_turn,
             profile=client_profile,
             catalogo=catalogo,
@@ -249,6 +257,8 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
     elif rep_draft:
         invoice_id = str(uuid.uuid4())
         await _calcular_y_timbrar_rep(invoice_id, rep_draft, client_profile, chat_id, message_id)
+    elif cancelacion:
+        await _solicitar_confirmacion_cancelacion(cancelacion, client_profile, chat_id, message_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1477,7 +1487,170 @@ async def handle_callback_query(callback_query: dict) -> None:
         await _execute_client_confirmation(command, invoice_id, pending)
         return
 
+    if command in ("cancelar_si", "cancelar_no"):
+        if not invoice_id:
+            await telegram_client.answer_callback_query(callback_id, "Acción inválida")
+            return
+        pending = await asyncio.to_thread(sheets_client.get_pending, invoice_id)
+        if not pending or str(pending.get("tipo_aprobacion", "")) != "cliente_cancelacion":
+            await telegram_client.answer_callback_query(callback_id, "Solicitud no encontrada")
+            return
+        # Mismo chequeo que la confirmación de facturas: solo el chat que
+        # pidió la cancelación puede confirmarla.
+        if chat_id != str(pending.get("canal_id_aprobador", "")):
+            logger.warning(
+                "chat_id %s intentó confirmar una cancelación que no le pertenece (id=%s)", chat_id, invoice_id,
+            )
+            await telegram_client.answer_callback_query(callback_id, "No autorizado")
+            return
+        client_profile = await asyncio.to_thread(
+            sheets_client.get_client_by_canal_id, str(pending.get("canal", "telegram")), chat_id
+        )
+        if not client_profile:
+            await telegram_client.answer_callback_query(callback_id, "No autorizado")
+            return
+        await telegram_client.answer_callback_query(callback_id, "Procesando...")
+        await _execute_cancelacion(command, invoice_id, pending, client_profile)
+        return
+
     await telegram_client.answer_callback_query(callback_id, "Acción inválida")
+
+
+# ---------------------------------------------------------------------------
+# Cancelación — la pide el cliente y la confirma él mismo con un botón
+# ---------------------------------------------------------------------------
+
+async def _solicitar_confirmacion_cancelacion(
+    cancelacion: CancelacionDraft, client_profile, chat_id: str, message_id: int
+) -> None:
+    # Claude solo puede elegir folios de las facturas recientes de este
+    # chat (enum de la tool), pero se re-verifica aquí contra bitácora.
+    fila = await asyncio.to_thread(
+        sheets_client.get_bitacora_por_folio, client_profile.despacho_id, chat_id, cancelacion.folio
+    )
+    if not fila or fila.get("estado") != "timbrado":
+        await telegram_client.send_message(
+            chat_id,
+            "No encontré esa factura vigente entre tus facturas recientes. "
+            "Si necesitas cancelarla, contacta al despacho."
+        )
+        return
+
+    try:
+        factura = await get_invoice(cancelacion.folio, client_profile.facturapi_key)
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        await telegram_client.send_message(
+            chat_id, "No pude consultar la factura en este momento. Intenta de nuevo en unos minutos."
+        )
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"⏱️ Error consultando {cancelacion.folio} para cancelarla ({client_profile.nombre_comercial})\n"
+            f"{type(exc).__name__}: {exc}"
+        )
+        return
+
+    if factura.get("status") != "valid" or factura.get("cancellation_status") == "pending":
+        await telegram_client.send_message(
+            chat_id, "Esa factura ya está cancelada o tiene una cancelación en proceso ante el SAT."
+        )
+        return
+
+    es_rep = fila.get("tipo") == "rep"
+    pending_id = str(uuid.uuid4())
+    await asyncio.to_thread(
+        sheets_client.save_pending,
+        invoice_id=pending_id,
+        canal="telegram",
+        canal_id=chat_id,
+        telegram_message_id=message_id,
+        invoice_json=json.dumps({
+            "folio": cancelacion.folio,
+            "motivo": cancelacion.motivo,
+            "bitacora_id": fila["id"],
+            "tipo": "rep" if es_rep else "ingreso",
+        }),
+        motivo_revision=f"Cancelación motivo {cancelacion.motivo}",
+        tipo_aprobacion="cliente_cancelacion",
+        canal_id_aprobador=chat_id,
+    )
+
+    e = html.escape
+    cliente = factura.get("customer") or {}
+    total = Decimal(str(factura.get("total") or fila.get("total") or 0))
+    lineas = [
+        f"⚠️ Vas a <b>CANCELAR</b> ante el SAT {'este complemento de pago' if es_rep else 'esta factura'}:",
+        "",
+        f"Folio: {e(_nombre_archivo_cfdi(factura, 'cfdi', cancelacion.folio))}",
+        f"Receptor: {e(str(cliente.get('legal_name', '')))} ({e(str(cliente.get('tax_id', fila.get('rfc_receptor', ''))))})",
+        f"Total: ${total:,.2f}",
+        f"Fecha: {e(str(factura.get('date', ''))[:10])}",
+        f"UUID: {e(str(factura.get('uuid', '')))}",
+        f"Motivo: {cancelacion.motivo} – {MOTIVOS_CANCELACION[cancelacion.motivo]}",
+        "",
+        "Esto no se puede deshacer. ¿Confirmas la cancelación?",
+    ]
+    await telegram_client.send_message(
+        chat_id, "\n".join(lineas),
+        reply_markup={"inline_keyboard": [[
+            {"text": "🗑️ Sí, cancelar", "callback_data": f"cancelar_si:{pending_id}"},
+            {"text": "↩️ No", "callback_data": f"cancelar_no:{pending_id}"},
+        ]]},
+    )
+
+
+async def _execute_cancelacion(command: str, pending_id: str, pending: dict, client_profile) -> None:
+    estado_actual = str(pending.get("estado", ""))
+    chat_id = str(pending["canal_id"])
+    if estado_actual != "pendiente":
+        await telegram_client.send_message(chat_id, "Esta solicitud de cancelación ya fue procesada.")
+        return
+
+    datos = json.loads(pending["invoice_json"])
+    tipo_texto = "REP" if datos.get("tipo") == "rep" else "factura"
+
+    if command == "cancelar_no":
+        await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "rechazado_cliente")
+        await telegram_client.send_message(chat_id, f"Listo, no se canceló la {tipo_texto}.")
+        return
+
+    # Se marca ANTES de llamar a FacturAPI: un doble clic no debe mandar
+    # dos solicitudes de cancelación.
+    await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "aprobado")
+    try:
+        result = await cancel_invoice(datos["folio"], datos["motivo"], client_profile.facturapi_key)
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        detalle = str(exc)[:500]
+        logger.warning("Cancelación de %s falló: %s", datos["folio"], detalle)
+        await telegram_client.send_message(
+            chat_id,
+            f"No se pudo cancelar la {tipo_texto}. El despacho ya fue notificado y te contactará."
+        )
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"🔴 Falló la cancelación que pidió {html.escape(client_profile.nombre_comercial)}\n"
+            f"FacturAPI id: {datos['folio']} · motivo {datos['motivo']}\n{html.escape(detalle)}"
+        )
+        return
+
+    nombre = _nombre_archivo_cfdi(result, "cfdi", datos["folio"])
+    if result.get("status") == "canceled":
+        estado, msg_cliente = "cancelado", f"✅ La {tipo_texto} {nombre} quedó cancelada ante el SAT."
+    else:
+        # status "valid" + cancellation_status "pending": el receptor tiene
+        # que aceptarla en su buzón tributario (FacturAPI actualiza el estado).
+        estado = "cancelacion_pendiente"
+        msg_cliente = (
+            f"⏳ Se solicitó la cancelación de la {tipo_texto} {nombre}. Tu cliente (el receptor) "
+            "tiene que aceptarla en su buzón tributario del SAT; si no responde en 72 horas, "
+            "el SAT la da por aceptada."
+        )
+    await asyncio.to_thread(sheets_client.update_bitacora_estado, datos["bitacora_id"], estado)
+    await telegram_client.send_message(chat_id, msg_cliente)
+    await telegram_client.send_message(
+        ALEJANDRO_CHAT_ID,
+        f"ℹ️ {html.escape(client_profile.nombre_comercial)} canceló la {tipo_texto} {nombre} "
+        f"(motivo {datos['motivo']}) → {estado}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1505,6 +1678,11 @@ async def check_pending(x_cron_secret: Optional[str] = Header(None)):
                 f"ℹ️ El cliente (canal_id: {canal_id}) no ha mandado en más de 24h el XML de la "
                 f"factura externa para su REP ({invoice_id}). Puedes darle seguimiento manual."
             )
+            continue
+
+        if tipo_aprobacion == "cliente_cancelacion":
+            # El cliente no confirmó su propia cancelación: no hay nada que
+            # aprobar del lado de ANB y la factura sigue vigente.
             continue
 
         if tipo_aprobacion == "cliente_confirmacion":

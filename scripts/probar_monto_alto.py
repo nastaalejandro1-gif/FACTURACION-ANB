@@ -20,7 +20,7 @@ async def probar():
     ]
     invoice_draft = None
     for texto in mensajes:
-        msg, invoice_draft, _ = run_conversation_turn(
+        msg, invoice_draft, _, _ = run_conversation_turn(
             profile=profile, catalogo=catalogo, history=history, user_text=texto,
         )
         print(f"Bot: {msg[:150]}")

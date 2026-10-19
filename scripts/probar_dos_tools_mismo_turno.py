@@ -27,7 +27,7 @@ def main():
     )
     print(f"Cliente: {texto}")
     try:
-        client_message, invoice_draft, rep_draft = run_conversation_turn(
+        client_message, invoice_draft, rep_draft, _ = run_conversation_turn(
             profile=profile, catalogo=catalogo, history=history, user_text=texto,
         )
     except Exception as exc:
@@ -42,7 +42,7 @@ def main():
     texto2 = "Si, confirmo los datos que ya tengas."
     print(f"Cliente: {texto2}")
     try:
-        client_message, invoice_draft, rep_draft = run_conversation_turn(
+        client_message, invoice_draft, rep_draft, _ = run_conversation_turn(
             profile=profile, catalogo=catalogo, history=history, user_text=texto2,
         )
     except Exception as exc:

@@ -41,7 +41,7 @@ def main():
 
     for i, kwargs in enumerate(pasos, 1):
         history = sheets_client.load_history(CHAT_ID_FALSO)  # <- fresco, como en produccion
-        client_message, invoice_draft, rep_draft = run_conversation_turn(
+        client_message, invoice_draft, rep_draft, _ = run_conversation_turn(
             profile=profile, catalogo=catalogo, history=history, **kwargs,
         )
         sheets_client.save_history("telegram", CHAT_ID_FALSO, history)  # <- despoja binarios

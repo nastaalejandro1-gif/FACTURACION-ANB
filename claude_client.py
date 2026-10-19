@@ -7,7 +7,7 @@ import anthropic
 from pydantic import ValidationError
 
 from config import ANTHROPIC_API_KEY, ANTHROPIC_EFFORT, ANTHROPIC_MODEL
-from models import ClientProfile, InvoiceDraft, RepDraft
+from models import CancelacionDraft, ClientProfile, InvoiceDraft, RepDraft
 from sat_catalogs import REGIMENES_FISCALES_VALIDOS
 from sheets_client import ClaveCatalogo, FacturaReciente, strip_binary_in_place
 from tools import build_invoice_tools
@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 MAX_TOOL_CYCLES = 3
+
+MENSAJE_CANCELACION = "Te mando los datos de la factura para que confirmes la cancelación. ⚠️"
 
 # Precios por millón de tokens (USD): input, output, cache write (5 min),
 # cache read. Solo para el log de costo; agregar aquí si se usa otro modelo.
@@ -158,11 +160,23 @@ reinicia después de cada factura completada, así que ESTA es tu única memoria
 que ya se procesó; NO tienes los conceptos línea por línea de facturas pasadas, solo
 este resumen):
 {_render_facturas_recientes(facturas_recientes)}
-Si el cliente pide cancelar o corregir una factura ya timbrada, es FUERA DE ALCANCE
-(ver abajo) — puedes usar este resumen para identificar CUÁL menciona y dar una
-respuesta más útil, pero igual debes remitirlo al despacho, nunca intentar cancelarla
-tú. Si pide "otra igual" pero a otro RFC, no tienes los conceptos exactos de la
+Si pide "otra igual" pero a otro RFC, no tienes los conceptos exactos de la
 anterior — pide que te los reenvíe o comparta la cotización de nuevo.
+
+CANCELACIONES:
+Si el cliente pide cancelar una factura o REP ya timbrado:
+1. Identifica CUÁL en la lista de arriba (solo las de estado "timbrado"). Si hay más de una
+   posible, pregúntale cuál mostrando receptor, total y fecha — nunca le muestres el
+   folio/UUID de la lista, es un id interno. Si no está en la lista o ya está
+   cancelada, dile que por aquí solo puedes cancelar sus facturas recientes y que para otras
+   contacte al despacho.
+2. Si no dijo el motivo, pregúntalo: ¿la factura tiene errores (02) o la operación no se llevó
+   a cabo (03)? Si quiere cancelarla SUSTITUYÉNDOLA por otra ligada (motivo 01), eso no se
+   puede por aquí: remítelo al despacho.
+3. Llama a request_invoice_cancellation con el folio exacto de la lista y el motivo. Tu mensaje
+   DEBE ser exactamente: "{MENSAJE_CANCELACION}"
+Nunca digas que ya está cancelada: el cliente la confirma con un botón y el sistema le avisa.
+Corregir una factura ya emitida = cancelarla (motivo 02) y pedir una nueva.
 
 CATÁLOGO DE CLAVES DE PRODUCTO/SERVICIO APROBADAS PARA ESTE CLIENTE:
 {_render_catalogo(catalogo)}
@@ -277,9 +291,9 @@ del primero. Cuando proceses el ÚLTIMO pedido del lote, omite el campo o pon
 mas_pedidos_en_este_lote=false.
 
 FUERA DE ALCANCE:
-Si el cliente pide algo que este flujo no puede procesar — nota de crédito, cancelación de
-un CFDI ya timbrado, corrección de una factura ya emitida, o cualquier otra gestión que no
-sea generar una factura de ingreso nueva o un REP — responde exactamente:
+Si el cliente pide algo que este flujo no puede procesar — nota de crédito, cancelación por
+sustitución (motivo 01), o cualquier otra gestión que no sea generar una factura de ingreso
+nueva, un REP o cancelar una factura reciente — responde exactamente:
 "Este tipo de solicitud no la puedo procesar por este medio. Por favor contacta directamente
 al despacho (ANB Consultores)."
 No llames ninguna herramienta en ese caso.
@@ -322,12 +336,12 @@ def run_conversation_turn(
     user_text: Optional[str] = None,
     file_bytes: Optional[bytes] = None,
     media_type: Optional[str] = None,
-) -> tuple[str, Optional[InvoiceDraft], Optional[RepDraft]]:
+) -> tuple[str, Optional[InvoiceDraft], Optional[RepDraft], Optional[CancelacionDraft]]:
     """
     Run one turn of the conversation.
 
     Returns:
-        (client_message, invoice_draft_or_None, rep_draft_or_None)
+        (client_message, invoice_draft_or_None, rep_draft_or_None, cancelacion_or_None)
 
     Nota: retorna DRAFTS (extracción sin montos), no InvoiceData/RepData ya
     calculados. El cálculo fiscal ocurre en main.py vía fiscal_engine,
@@ -354,7 +368,10 @@ def run_conversation_turn(
         "cache_control": {"type": "ephemeral"},
     }]
 
-    tools = build_invoice_tools([c.clave_prod_serv for c in catalogo])
+    tools = build_invoice_tools(
+        [c.clave_prod_serv for c in catalogo],
+        [f.folio_fiscal for f in facturas_recientes if f.estado == "timbrado" and f.folio_fiscal],
+    )
     # Claude a veces intenta resolver 2 pedidos del cliente en un mismo turno
     # (ej. "REP de la factura X y además una factura nueva para Y") llamando
     # 2 tools en paralelo. El código de abajo solo procesa la primera, y la
@@ -399,13 +416,15 @@ def run_conversation_turn(
                 ],
             })
 
-            if tool_name in ("generate_invoice_draft", "generate_rep_draft"):
+            if tool_name in ("generate_invoice_draft", "generate_rep_draft", "request_invoice_cancellation"):
                 # Validate before doing anything fiscal
                 try:
                     if tool_name == "generate_invoice_draft":
                         result_data = InvoiceDraft(**tool_input)
-                    else:
+                    elif tool_name == "generate_rep_draft":
                         result_data = RepDraft(**tool_input)
+                    else:
+                        result_data = CancelacionDraft(**tool_input)
                 except ValidationError as e:
                     logger.warning("Validación de %s falló: %s", tool_name, e)
                     _log_uso_claude(f"{paso_base}→retry_validacion_{tool_name}", response)
@@ -428,7 +447,10 @@ def run_conversation_turn(
                 # el modelo devuelve un bloque de texto + el tool_use en la
                 # misma respuesta. Esto elimina una llamada completa a la API
                 # (con su round-trip de latencia) por cada factura/REP generado.
-                client_message = extract_text_from_response(response) or "Tu solicitud ha sido procesada."
+                client_message = extract_text_from_response(response) or (
+                    MENSAJE_CANCELACION if tool_name == "request_invoice_cancellation"
+                    else "Tu solicitud ha sido procesada."
+                )
 
                 # Aun así hay que registrar el tool_result en el historial
                 # (aunque no se vuelva a llamar a la API en este turno): la
@@ -477,9 +499,10 @@ def run_conversation_turn(
 
                 _log_uso_claude(f"{paso_base}→{tool_name}", response)
                 if isinstance(result_data, InvoiceDraft):
-                    return client_message, result_data, None
-                else:
-                    return client_message, None, result_data
+                    return client_message, result_data, None, None
+                if isinstance(result_data, RepDraft):
+                    return client_message, None, result_data, None
+                return client_message, None, None, result_data
 
         else:
             # Regular text response — no tool call
@@ -492,11 +515,11 @@ def run_conversation_turn(
                     for b in response.content
                 ],
             })
-            return client_message, None, None
+            return client_message, None, None, None
 
     # Exceeded MAX_TOOL_CYCLES without resolution
     logger.error("Se alcanzó el límite de ciclos tool_use sin resolución")
-    return "Hubo un problema procesando tu solicitud. Por favor contacta al despacho.", None, None
+    return "Hubo un problema procesando tu solicitud. Por favor contacta al despacho.", None, None, None
 
 
 # ---------------------------------------------------------------------------

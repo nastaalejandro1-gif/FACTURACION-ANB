@@ -38,7 +38,7 @@ async def main():
     rep_draft = None
     for texto in mensajes:
         print(f"Cliente: {texto}")
-        client_message, invoice_draft, rep_draft = run_conversation_turn(
+        client_message, invoice_draft, rep_draft, _ = run_conversation_turn(
             profile=profile, catalogo=catalogo, history=history, user_text=texto,
         )
         print(f"Bot: {client_message}\n")

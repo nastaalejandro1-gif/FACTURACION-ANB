@@ -24,7 +24,7 @@ def main():
     for i, texto in enumerate(pasos, 1):
         history = sheets_client.load_history(CHAT_ID_FALSO)
         try:
-            msg, inv, rep = run_conversation_turn(
+            msg, inv, rep, _ = run_conversation_turn(
                 profile=profile, catalogo=catalogo, history=history, user_text=texto,
             )
         except Exception as exc:

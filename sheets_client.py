@@ -343,6 +343,32 @@ def get_facturas_recientes(despacho_id: str, canal_id: str, limite: int = 3) -> 
     ]
 
 
+def get_bitacora_por_folio(despacho_id: str, canal_id: str, folio_fiscal: str) -> Optional[dict]:
+    """Fila de bitácora de ese folio de FacturAPI SOLO si es de este canal_id
+    (un cliente no puede cancelar la factura de otro)."""
+    sb = _get_supabase()
+    result = (
+        sb.table("bitacora")
+        .select("*")
+        .eq("despacho_id", despacho_id)
+        .eq("canal_id", str(int(float(canal_id))))
+        .eq("folio_fiscal", folio_fiscal)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def update_bitacora_estado(bitacora_id: str, estado: str, error_detalle: str = "") -> None:
+    """estado: 'cancelado' o 'cancelacion_pendiente'. Un REP cancelado deja de
+    contar en get_rep_history (filtra estado='timbrado')."""
+    sb = _get_supabase()
+    row = {"estado": estado}
+    if error_detalle:
+        row["error_detalle"] = error_detalle
+    sb.table("bitacora").update(row).eq("id", bitacora_id).execute()
+
+
 def get_rep_history(uuid_factura_origen: str) -> list[dict]:
     """Retorna los REPs timbrados para un UUID de factura origen, ordenados por timestamp.
 

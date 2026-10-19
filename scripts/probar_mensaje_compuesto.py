@@ -28,7 +28,7 @@ def main():
         print(f"--- Turno {i} ---")
         print(f"Cliente: {texto}")
         try:
-            client_message, invoice_draft, rep_draft = run_conversation_turn(
+            client_message, invoice_draft, rep_draft, _ = run_conversation_turn(
                 profile=profile, catalogo=catalogo, history=history, user_text=texto,
             )
         except Exception as exc:
@@ -45,7 +45,7 @@ def main():
         texto = "Sí, confirmo todo."
         print(f"Cliente: {texto}")
         try:
-            client_message, invoice_draft, rep_draft = run_conversation_turn(
+            client_message, invoice_draft, rep_draft, _ = run_conversation_turn(
                 profile=profile, catalogo=catalogo, history=history, user_text=texto,
             )
         except Exception as exc:

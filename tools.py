@@ -22,15 +22,53 @@ FORMAS_PAGO_ENUM_REP = [f for f in FORMAS_PAGO_ENUM if f != "99"]
 CLAVE_NUEVA = "NUEVA"
 
 
-def build_invoice_tools(claves_catalogo: list[str]) -> list[dict]:
+def build_invoice_tools(claves_catalogo: list[str], folios_cancelables: list[str] = ()) -> list[dict]:
     """
     claves_catalogo: códigos clave_prod_serv aprobados para este cliente
     (propios + globales del despacho, ver sheets_client.get_catalogo_claves).
     Se arma en cada turno porque el catálogo puede crecer cuando ANB aprueba
     una clave nueva.
+
+    folios_cancelables: ids de FacturAPI de las facturas/REPs timbrados
+    recientes de ESTE cliente. Son el enum de la herramienta de cancelación
+    (Claude no puede inventar un folio ni cancelar uno de otro cliente); sin
+    folios, la herramienta no se ofrece.
     """
     claves_enum = list(dict.fromkeys([*claves_catalogo, CLAVE_NUEVA]))
+    tools = _invoice_tools(claves_enum)
+    if folios_cancelables:
+        tools.append({
+            "name": "request_invoice_cancellation",
+            "description": (
+                "Solicita cancelar ante el SAT una factura o REP ya timbrado de este cliente. "
+                "Llamar SOLO cuando el cliente pidió cancelar, ya identificaste CUÁL (de la lista "
+                "de facturas recientes) y el motivo. El sistema le pide confirmación final con un "
+                "botón antes de cancelar."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "folio": {
+                        "type": "string",
+                        "enum": list(dict.fromkeys(folios_cancelables)),
+                        "description": "folio/UUID de la factura a cancelar, tal como aparece en la lista de facturas recientes.",
+                    },
+                    "motivo": {
+                        "type": "string",
+                        "enum": ["02", "03"],
+                        "description": (
+                            "02 = la factura tiene errores (datos, montos, conceptos) y NO se va a "
+                            "sustituir por otra ligada; 03 = la operación no se llevó a cabo."
+                        ),
+                    },
+                },
+                "required": ["folio", "motivo"],
+            },
+        })
+    return tools
 
+
+def _invoice_tools(claves_enum: list[str]) -> list[dict]:
     return [
         {
             "name": "generate_invoice_draft",

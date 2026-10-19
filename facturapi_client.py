@@ -229,6 +229,33 @@ async def download_xml(invoice_id: str, facturapi_key: str) -> bytes:
         return response.content
 
 
+@_facturapi_retry_write
+async def cancel_invoice(invoice_id: str, motive: str, facturapi_key: str) -> dict:
+    """
+    Solicita la cancelación ante el SAT (DELETE /invoices/{id}?motive=..).
+    Devuelve el invoice: status "canceled" si quedó cancelada, o status
+    "valid" + cancellation_status "pending" si el receptor debe aceptarla
+    en su buzón tributario. Un 400 trae el motivo del rechazo (ej. tiene
+    REPs relacionados vigentes, o ya estaba cancelada).
+    """
+    headers = {"Authorization": f"Bearer {facturapi_key}"}
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        response = await client.delete(
+            f"{FACTURAPI_BASE_URL}/invoices/{invoice_id}",
+            params={"motive": motive},
+            headers=headers,
+        )
+    if response.status_code == 400:
+        logger.warning("FacturAPI rechazó la cancelación (400): %s", response.text)
+        raise httpx.HTTPStatusError(
+            f"Error de cancelación FacturAPI: {response.text}",
+            request=response.request,
+            response=response,
+        )
+    response.raise_for_status()
+    return response.json()
+
+
 @_facturapi_retry
 async def search_invoice_by_uuid(uuid: str, facturapi_key: str) -> Optional[dict]:
     """Busca una factura en FacturAPI por su UUID/folio fiscal. Retorna el objeto o None."""
