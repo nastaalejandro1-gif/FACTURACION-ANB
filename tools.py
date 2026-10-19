@@ -210,12 +210,20 @@ def _invoice_tools(claves_enum: list[str]) -> list[dict]:
                     },
                     "monto_pagado": {
                         "type": "number",
-                        "description": "Monto pagado en esta transacción.",
+                        "description": "Monto pagado en esta transacción. Omítelo si liquidar_saldo=true.",
+                    },
+                    "liquidar_saldo": {
+                        "type": "boolean",
+                        "description": (
+                            "true si el cliente dice que este pago LIQUIDA lo que resta de la "
+                            "factura sin dar el monto: el sistema calcula el saldo pendiente y lo "
+                            "usa como monto pagado. Si el cliente sí dio un monto, usa monto_pagado."
+                        ),
                     },
                 },
                 "required": [
                     "estatus", "uuid_factura_origen", "receptor",
-                    "fecha_pago", "forma_pago", "monto_pagado",
+                    "fecha_pago", "forma_pago",
                 ],
             },
         },

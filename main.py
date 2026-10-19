@@ -430,7 +430,7 @@ def _detalle_para_revision(
             f"RFC {e(r.rfc)} · Régimen {e(r.regimen_fiscal)} · CP {e(r.cp_fiscal)}",
             f"<b>Factura origen:</b> {e(rep.uuid_factura_origen)}",
             f"<b>Fecha de pago:</b> {e(rep.fecha_pago)} · Forma de pago {e(rep.forma_pago)}",
-            f"<b>Monto pagado:</b> ${rep.monto_pagado:,.2f}",
+            f"<b>Monto pagado:</b> {rep.texto_monto()}",
             *_detalle_factura_origen(envelope.factura_origen),
         ])
 
@@ -804,12 +804,12 @@ async def _pedir_xml_factura_origen(
     await telegram_client.send_message(
         ALEJANDRO_CHAT_ID,
         f"ℹ️ REP de factura externa: pedí el XML a {html.escape(client_profile.nombre_comercial)}\n"
-        f"UUID: {html.escape(draft.uuid_factura_origen)}\nMonto: ${draft.monto_pagado:,.2f}"
+        f"UUID: {html.escape(draft.uuid_factura_origen)}\nMonto: {draft.texto_monto()}"
     )
 
 
 async def _rechazar_factura_origen(
-    client_profile, chat_id: str, origen: dict, problemas: list[str], monto_pagado
+    client_profile, chat_id: str, origen: dict, problemas: list[str], texto_monto: str
 ) -> None:
     detalle = "\n".join(f"• {html.escape(p)}" for p in problemas)
     await telegram_client.send_message(
@@ -821,7 +821,7 @@ async def _rechazar_factura_origen(
         ALEJANDRO_CHAT_ID,
         f"⚠️ REP de factura externa no procesable — {html.escape(client_profile.nombre_comercial)}\n"
         f"UUID: {html.escape(origen.get('uuid', ''))} (fuente: {origen.get('fuente')})\n"
-        f"Monto pagado: ${Decimal(str(monto_pagado)):,.2f}\n{detalle}\n\n"
+        f"Monto pagado: {texto_monto}\n{detalle}\n\n"
         "Si procede, timbra el REP a mano en FacturAPI."
     )
 
@@ -901,7 +901,7 @@ async def _procesar_pdf_factura_origen(
     await asyncio.to_thread(sheets_client.update_pending_status, esperando["id"], "pdf_recibido")
     problemas = cfdi_xml.problemas_para_rep(origen, client_profile.rfc)
     if problemas:
-        await _rechazar_factura_origen(client_profile, chat_id, origen, problemas, draft.monto_pagado)
+        await _rechazar_factura_origen(client_profile, chat_id, origen, problemas, draft.texto_monto())
         return True
 
     draft = draft.model_copy(update={"receptor": _receptor_de_origen(origen, draft.receptor)})
@@ -959,16 +959,47 @@ async def _calcular_y_timbrar_rep(
     if externa:
         problemas = cfdi_xml.problemas_para_rep(original_invoice, client_profile.rfc)
         if problemas:
-            await _rechazar_factura_origen(client_profile, chat_id, original_invoice, problemas, draft.monto_pagado)
+            await _rechazar_factura_origen(client_profile, chat_id, original_invoice, problemas, draft.texto_monto())
             return
         draft = draft.model_copy(update={"receptor": _receptor_de_origen(original_invoice, draft.receptor)})
 
     previous_reps = await asyncio.to_thread(sheets_client.get_rep_history, draft.uuid_factura_origen)
     imp_saldo_ant = _saldo_anterior(original_invoice, previous_reps)
 
-    resultado = fiscal_engine.calcular_rep(
-        monto_pagado=Decimal(str(draft.monto_pagado)), imp_saldo_ant=imp_saldo_ant
-    )
+    if draft.liquidar_saldo and externa and not previous_reps and not original_invoice.get("saldo_confirmado"):
+        # Factura de otro programa: el bot no sabe si ya hubo pagos allá. Un
+        # REP normal supone primer pago y lo puede corregir el cliente, pero en
+        # una liquidación ese supuesto se vuelve el MONTO: lo fija ANB.
+        envelope = PendingPayload(
+            tipo="rep",
+            escalation_reason=EscalationReason.PAGOS_PREVIOS_EXTERNOS.value,
+            escalation_detail=(
+                "liquidación de una factura hecha en otro programa: el bot no conoce los pagos previos. "
+                "Confirma con el cliente el saldo pendiente antes de este pago y qué número de parcialidad "
+                f"es, y aprueba con /aprobar {invoice_id} saldo=SALDO_PENDIENTE parcialidad=N"
+            ),
+            rep_draft=draft,
+            factura_origen=original_invoice,
+        )
+        await _escalar_a_anb(invoice_id, chat_id, message_id, client_profile, envelope)
+        return
+
+    if draft.liquidar_saldo:
+        # Liquidación: el monto es lo que resta de la factura, calculado
+        # aquí con el mismo saldo que usa el REP (nunca lo da Claude).
+        if imp_saldo_ant <= 0:
+            await telegram_client.send_message(
+                chat_id,
+                "Esa factura ya está liquidada: su saldo pendiente es $0.00, así que no hace "
+                "falta otro complemento de pago."
+            )
+            return
+        draft = draft.model_copy(update={"monto_pagado": float(imp_saldo_ant)})
+        monto_pagado = imp_saldo_ant
+    else:
+        monto_pagado = Decimal(str(draft.monto_pagado))
+
+    resultado = fiscal_engine.calcular_rep(monto_pagado=monto_pagado, imp_saldo_ant=imp_saldo_ant)
 
     if resultado.escalation:
         envelope = PendingPayload(
@@ -991,6 +1022,7 @@ async def _calcular_y_timbrar_rep(
         monto_pagado=resultado.rep.monto_pagado,
         imp_saldo_ant=resultado.rep.imp_saldo_ant,
         imp_saldo_insoluto=resultado.rep.imp_saldo_insoluto,
+        liquidacion=draft.liquidar_saldo,
         factura_origen_externa=original_invoice if externa else None,
     )
     # Factura de otro programa sin pagos nuestros ni saldo fijado por ANB:
@@ -1029,6 +1061,8 @@ async def _solicitar_confirmacion_cliente_rep(
         f"Saldo anterior: ${rep_data.imp_saldo_ant:,.2f}",
         f"Saldo insoluto después de este pago: ${rep_data.imp_saldo_insoluto:,.2f}",
     ]
+    if rep_data.liquidacion:
+        lineas.append("✔️ Este pago liquida la factura (es todo el saldo pendiente).")
     teclado = [[
         {"text": "✅ Sí, confirmar", "callback_data": f"cliente_si:{invoice_id}"},
         {"text": "❌ No, corregir", "callback_data": f"cliente_no:{invoice_id}"},
@@ -1396,7 +1430,9 @@ async def _execute_client_confirmation(command: str, invoice_id: str, pending: d
             receptor=rep_data.receptor,
             fecha_pago=rep_data.fecha_pago,
             forma_pago=rep_data.forma_pago,
-            monto_pagado=float(rep_data.monto_pagado),
+            # Liquidación: con el saldo real que fije ANB el monto se recalcula.
+            monto_pagado=None if rep_data.liquidacion else float(rep_data.monto_pagado),
+            liquidar_saldo=rep_data.liquidacion,
         )
         envelope = PendingPayload(
             tipo="rep",

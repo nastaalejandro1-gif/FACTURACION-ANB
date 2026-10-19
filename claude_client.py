@@ -1,7 +1,9 @@
 import base64
 import logging
 import re
+from datetime import date, datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import anthropic
 from pydantic import ValidationError
@@ -19,6 +21,20 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 MAX_TOOL_CYCLES = 3
 
 MENSAJE_CANCELACION = "Te mando los datos de la factura para que confirmes la cancelación. ⚠️"
+
+# Si el modelo llama la tool sin texto, el cliente recibe el mismo mensaje
+# que el prompt le pide escribir en cada flujo.
+MENSAJES_TRAS_TOOL = {
+    "generate_invoice_draft": (
+        "¡Listo! Ya tengo todos los datos. En un momento te mando el total calculado (con impuestos) "
+        "para que lo confirmes antes de timbrar. 📊"
+    ),
+    "generate_rep_draft": (
+        "¡Listo! En un momento te mando el resumen del complemento de pago para que lo confirmes "
+        "antes de timbrarlo. 📊"
+    ),
+    "request_invoice_cancellation": MENSAJE_CANCELACION,
+}
 
 # Precios por millón de tokens (USD): input, output, cache write (5 min),
 # cache read. Solo para el log de costo; agregar aquí si se usa otro modelo.
@@ -128,7 +144,9 @@ def _render_facturas_recientes(facturas: list[FacturaReciente]) -> str:
 
 def build_system_prompt(
     profile: ClientProfile, catalogo: list[ClaveCatalogo], facturas_recientes: list[FacturaReciente],
+    hoy: Optional[date] = None,
 ) -> str:
+    hoy = hoy or datetime.now(ZoneInfo("America/Mexico_City")).date()
     return f"""Eres un asistente de facturación del Despacho ANB Consultores. Tu función es recolectar y clasificar la información necesaria para preparar una solicitud de CFDI 4.0 en México.
 
 Tu trabajo NO es calcular impuestos ni timbrar facturas directamente. Tu trabajo es:
@@ -267,8 +285,15 @@ Cuando el cliente manda un CFDI (PDF de factura con folio fiscal UUID) avisando 
 3. Pregunta en UN SOLO MENSAJE lo que falte entre: fecha de pago y forma de pago real.
    - Si ya vienen en el mensaje del cliente, NO los preguntes.
    - Forma de pago: 03=Transferencia, 04=Tarjeta crédito, 28=Tarjeta débito, 01=Efectivo. NO puede ser 99.
-   - Fecha: si solo da día/mes sin hora, usa T12:00:00.
-4. Muestra resumen (UUID, monto pagado, forma de pago, fecha) y pide confirmación.
+   - Fecha: si solo da día/mes sin hora, usa T12:00:00. HOY es {hoy.isoformat()}: si no dice el
+     año, usa el de la fecha más reciente que no sea futura; "hoy"/"ayer" se calculan con esta fecha.
+   - NO preguntes uso CFDI: en un REP siempre es CP01 (Pagos), ponlo tú.
+   LIQUIDACIÓN: si el cliente dice que el pago liquida/salda lo que resta de la factura
+   ("liquídala", "pagaron el resto", "con lo que falta") y NO da el monto, NO se lo
+   preguntes ni lo calcules: usa liquidar_saldo=true sin monto_pagado — el sistema calcula
+   el saldo pendiente y se lo muestra en el resumen.
+4. Muestra resumen (UUID, monto pagado — o "lo que resta" si es liquidación —, forma de pago,
+   fecha) y pide confirmación.
 5. Al confirmar, llama a generate_rep_draft. NUNCA llames generate_invoice_draft para un REP.
    El sistema calcula el saldo insoluto — no lo calcules tú. Tu mensaje de respuesta DEBE ser
    exactamente este (no menciones "despacho" ni "revisión" — el sistema te vuelve a escribir A
@@ -447,10 +472,7 @@ def run_conversation_turn(
                 # el modelo devuelve un bloque de texto + el tool_use en la
                 # misma respuesta. Esto elimina una llamada completa a la API
                 # (con su round-trip de latencia) por cada factura/REP generado.
-                client_message = extract_text_from_response(response) or (
-                    MENSAJE_CANCELACION if tool_name == "request_invoice_cancellation"
-                    else "Tu solicitud ha sido procesada."
-                )
+                client_message = extract_text_from_response(response) or MENSAJES_TRAS_TOOL[tool_name]
 
                 # Aun así hay que registrar el tool_result en el historial
                 # (aunque no se vuelva a llamar a la API en este turno): la

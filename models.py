@@ -96,7 +96,21 @@ class RepDraft(BaseModel):
     receptor: ReceptorData
     fecha_pago: str
     forma_pago: str
-    monto_pagado: float = Field(gt=0)
+    # None solo si liquidar_saldo: el monto es el saldo pendiente, que
+    # calcula el sistema (_calcular_y_timbrar_rep), no el cliente ni Claude.
+    monto_pagado: Optional[float] = Field(default=None, gt=0)
+    liquidar_saldo: bool = False
+
+    @model_validator(mode="after")
+    def validate_monto_o_liquidacion(self) -> "RepDraft":
+        if self.monto_pagado is None and not self.liquidar_saldo:
+            raise ValueError("monto_pagado es obligatorio salvo que liquidar_saldo sea true")
+        return self
+
+    def texto_monto(self) -> str:
+        if self.monto_pagado is None:
+            return "saldo pendiente (liquidación)"
+        return f"${self.monto_pagado:,.2f}"
 
     @field_validator("forma_pago")
     @classmethod
@@ -239,6 +253,9 @@ class RepData(BaseModel):
     monto_pagado: Decimal = Field(gt=0)
     imp_saldo_ant: Decimal = Field(ge=0)
     imp_saldo_insoluto: Decimal = Field(ge=0)
+    # El cliente pidió liquidar: si cambia el saldo (ej. pagos previos en otro
+    # programa) el monto se vuelve a tomar del saldo, no se queda fijo.
+    liquidacion: bool = False
     # Factura hecha en otro programa (leída de su XML/PDF, ver cfdi_xml.py).
     # Viaja en el pendiente para que al confirmar no se busque en FacturAPI,
     # que no la conoce.
