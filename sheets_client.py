@@ -477,6 +477,31 @@ def update_bitacora_estado(bitacora_id: str, estado: str, error_detalle: str = "
     return bool(result.data)
 
 
+def get_cancelaciones_en_espera() -> list[dict]:
+    """CFDI cuya cancelación espera que el receptor la acepte en el SAT."""
+    sb = _get_supabase()
+    result = (
+        sb.table("bitacora").select("*")
+        .eq("despacho_id", DESPACHO_ID).eq("estado", "cancelacion_pendiente")
+        .execute()
+    )
+    return result.data or []
+
+
+def get_solicitud_cancelacion(bitacora_id: str) -> Optional[dict]:
+    """El pendiente con el que alguien confirmó la cancelación de ese registro
+    de bitácora: dice qué chat la pidió y cuándo."""
+    sb = _get_supabase()
+    result = (
+        sb.table("pendientes").select("*")
+        .eq("tipo_aprobacion", "cliente_cancelacion").eq("estado", "aprobado")
+        .like("invoice_json", f"%{bitacora_id}%")
+        .order("timestamp", desc=True).limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
 def get_rep_history(uuid_factura_origen: str) -> list[dict]:
     """Retorna los REPs timbrados para un UUID de factura origen, ordenados por timestamp.
 

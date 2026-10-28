@@ -37,6 +37,7 @@ async def test_check_pending_manda_un_solo_resumen_y_marca_notificados(monkeypat
         {"id": "canc-1", "tipo_aprobacion": "cliente_cancelacion", "canal_id": "555", "invoice_json": "{}"},
     ]
     monkeypatch.setattr(main.sheets_client, "limpiar_updates_viejos", lambda: None)
+    monkeypatch.setattr(main.sheets_client, "get_cancelaciones_en_espera", lambda: [])
     monkeypatch.setattr(main.sheets_client, "get_overdue_pending", lambda horas: filas)
     monkeypatch.setattr(main.sheets_client, "get_client_by_canal_id", lambda canal, cid: CLIENT_PROFILE)
     marcados = []
@@ -50,13 +51,15 @@ async def test_check_pending_manda_un_solo_resumen_y_marca_notificados(monkeypat
     assert "Por revisar (1)" in texto and "no ha confirmado (1)" in texto
     assert "aprobar:rev-1" in str(teclado)
     assert sorted(marcados) == ["canc-1", "conf-1", "rev-1"]
-    assert resultado == {"checked": 3}
+    assert resultado == {"checked": 3, "cancelaciones": 0}
 
 
 @pytest.mark.asyncio
 async def test_check_pending_sin_nada_nuevo_no_manda_mensaje(monkeypatch):
     sent, _, _ = _patch_common(monkeypatch)
     monkeypatch.setattr(main.sheets_client, "limpiar_updates_viejos", lambda: None)
+    monkeypatch.setattr(main.sheets_client, "get_cancelaciones_en_espera", lambda: [])
     monkeypatch.setattr(main.sheets_client, "get_overdue_pending", lambda horas: [])
-    assert await main.check_pending(x_cron_secret=main.CRON_SECRET) == {"checked": 0}
+    monkeypatch.setattr(main.sheets_client, "marcar_notificados", lambda ids: None)
+    assert await main.check_pending(x_cron_secret=main.CRON_SECRET) == {"checked": 0, "cancelaciones": 0}
     assert sent == []

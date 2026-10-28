@@ -118,7 +118,8 @@ clasifica, el código calcula (Decimal, tolerancia cero). Migrado a producción 
 - [x] Límite de 20 mensajes / 10 min por chat (Alejandro exento) y archivos de máx. 10 MB (28 oct 2026)
 - [x] Formato Telegram (28 oct 2026): Markdown de Claude → HTML (`markdown_a_html`); mensajes >4096 se parten
 - [x] Borrado el código muerto de Google (28 oct 2026); `pytest` sin ruta ya funciona
-- [ ] Seguimiento de cancelaciones en `cancelacion_pendiente` (el receptor tiene 72h para aceptar)
+- [x] Seguimiento de cancelaciones (28 oct 2026): el cron consulta FacturAPI cada `cancelacion_pendiente`;
+      cancelada -> aviso a quien la pidio; rechazada -> vuelve a timbrado + aviso; >5 dias sin respuesta -> a Alejandro.
 
 ## Pre-SaaS (antes de vender a otro despacho)
 

@@ -5,7 +5,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -2107,8 +2107,6 @@ async def check_pending(x_cron_secret: Optional[str] = Header(None)):
     # Un solo resumen por corrida, y cada pendiente se repite como mucho una
     # vez cada 24h (pendientes.notificado_at).
     overdue = await asyncio.to_thread(sheets_client.get_overdue_pending, 24)
-    if not overdue:
-        return {"checked": 0}
 
     revisiones: list[str] = []
     sin_confirmar: list[str] = []
@@ -2163,17 +2161,115 @@ async def check_pending(x_cron_secret: Optional[str] = Header(None)):
         )
     if sin_xml:
         secciones.append(f"<b>Falta el XML de la factura externa ({len(sin_xml)}):</b>\n" + "\n".join(sin_xml))
+
+    try:
+        cancelaciones_resueltas, cancelaciones_atoradas = await _seguir_cancelaciones()
+    except Exception:
+        logger.exception("Falló el seguimiento de cancelaciones")
+        cancelaciones_resueltas, cancelaciones_atoradas = [], []
+    if cancelaciones_resueltas:
+        secciones.append("<b>Cancelaciones resueltas:</b>\n" + "\n".join(cancelaciones_resueltas))
+    if cancelaciones_atoradas:
+        secciones.append("<b>Cancelaciones sin resolver:</b>\n" + "\n".join(cancelaciones_atoradas))
+
     if secciones:
         await telegram_client.send_message(
             ALEJANDRO_CHAT_ID,
-            "🗂️ <b>Pendientes de más de 24h</b>\n\n" + "\n\n".join(secciones),
+            "🗂️ <b>Pendientes</b>\n\n" + "\n\n".join(secciones),
             reply_markup={"inline_keyboard": teclado} if teclado else None,
         )
     await asyncio.to_thread(sheets_client.marcar_notificados, [str(r["id"]) for r in overdue if r.get("id")])
-    return {"checked": len(overdue)}
+    return {"checked": len(overdue), "cancelaciones": len(cancelaciones_resueltas) + len(cancelaciones_atoradas)}
 
 
 MAX_FILAS_TECLADO_RESUMEN = 30  # los demás se aprueban con los comandos del texto
+DIAS_CANCELACION_SIN_RESPUESTA = 5  # el SAT da 72h al receptor; más que eso, revisar a mano
+
+
+async def _seguir_cancelaciones() -> tuple[list[str], list[str]]:
+    """
+    Consulta en FacturAPI cada CFDI en 'cancelacion_pendiente' (el receptor
+    tenía que aceptarla en su buzón del SAT) y cierra el ciclo:
+    - cancelada -> bitácora 'cancelado' y aviso a quien la pidió;
+    - rechazada por el receptor -> vuelve a 'timbrado' (sigue vigente) y aviso;
+    - sin respuesta después de DIAS_CANCELACION_SIN_RESPUESTA, o un estado
+      inesperado -> a Alejandro, como mucho una vez al día.
+    Devuelve (resueltas, atoradas): líneas para el resumen de Alejandro.
+    """
+    filas = await asyncio.to_thread(sheets_client.get_cancelaciones_en_espera)
+    if not filas:
+        return [], []
+    clientes = await asyncio.to_thread(sheets_client.get_clientes_activos)
+    emisores = {c.rfc.upper(): c for c, _ in clientes if c.facturapi_key}
+
+    resueltas: list[str] = []
+    atoradas: list[str] = []
+    ahora = datetime.now(timezone.utc)
+    for fila in filas:
+        perfil = emisores.get(str(fila.get("rfc_emisor", "")).upper())
+        folio = str(fila.get("folio_fiscal", ""))
+        if perfil is None:
+            logger.warning("Cancelación %s: no hay llave de FacturAPI para %s", folio, fila.get("rfc_emisor"))
+            continue
+        try:
+            factura = await get_invoice(folio, perfil.facturapi_key)
+        except (httpx.HTTPStatusError, httpx.RequestError):
+            logger.exception("No se pudo consultar la cancelación de %s", folio)
+            continue
+
+        solicitud = await asyncio.to_thread(sheets_client.get_solicitud_cancelacion, str(fila["id"]))
+        chat = str(solicitud["canal_id"]) if solicitud else str(fila.get("canal_id", ""))
+        nombre = _nombre_archivo_cfdi(factura, "cfdi", folio)
+        tipo_texto = "REP" if fila.get("tipo") == "rep" else "factura"
+        emisor = html.escape(perfil.nombre_comercial)
+        estado_cancelacion = factura.get("cancellation_status")
+
+        if factura.get("status") == "canceled":
+            await asyncio.to_thread(sheets_client.update_bitacora_estado, str(fila["id"]), "cancelado")
+            await telegram_client.send_message(chat, f"✅ La {tipo_texto} {nombre} ya quedó cancelada ante el SAT.")
+            resueltas.append(f"• {emisor} {nombre}: cancelada ✅")
+            continue
+
+        if estado_cancelacion == "rejected":
+            await asyncio.to_thread(
+                sheets_client.update_bitacora_estado, str(fila["id"]), "timbrado",
+                "El receptor rechazó la cancelación en su buzón del SAT",
+            )
+            await telegram_client.send_message(
+                chat,
+                f"❌ Tu cliente (el receptor) rechazó en el SAT la cancelación de la {tipo_texto} {nombre}, "
+                "así que sigue vigente. El despacho te contactará para ver cómo seguir.",
+            )
+            resueltas.append(f"• {emisor} {nombre}: el receptor RECHAZÓ la cancelación, sigue vigente ❌")
+            continue
+
+        # Sigue en espera (o un estado que no esperamos): se avisa a Alejandro
+        # pasado el plazo, una vez al día (notificado_at de la solicitud).
+        pedida = _fecha((solicitud or {}).get("timestamp_respuesta") or fila.get("timestamp"))
+        dias = (ahora - pedida).days if pedida else DIAS_CANCELACION_SIN_RESPUESTA
+        inesperado = estado_cancelacion != "pending"
+        if not inesperado and dias < DIAS_CANCELACION_SIN_RESPUESTA:
+            continue
+        avisado = _fecha((solicitud or {}).get("notificado_at"))
+        if avisado and ahora - avisado < timedelta(hours=24):
+            continue
+        detalle = (
+            f"estado en FacturAPI {html.escape(str(factura.get('status')))}/{html.escape(str(estado_cancelacion))}"
+            if inesperado else f"pedida hace {dias} días y el receptor no responde"
+        )
+        atoradas.append(f"• {emisor} {nombre}: {detalle}. Revísala a mano.")
+        if solicitud:
+            await asyncio.to_thread(sheets_client.marcar_notificados, [str(solicitud["id"])])
+    return resueltas, atoradas
+
+
+def _fecha(valor) -> Optional[datetime]:
+    if not valor:
+        return None
+    try:
+        return datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _id_emisor_de_pendiente(datos: dict) -> str:
