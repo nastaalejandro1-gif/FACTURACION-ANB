@@ -207,13 +207,17 @@ def set_emisor_activo(canal_id: str, id_cliente: str) -> None:
 # Conversation history
 # ---------------------------------------------------------------------------
 
-def load_history(canal_id: str) -> list:
+def load_history(canal_id: str, canal: str = "telegram") -> list:
     sb = _get_supabase()
     canal_id_str = str(int(float(canal_id)))
 
+    # Filtrar por canal: el mismo chat tiene otra fila en conversaciones con
+    # canal='emisor_activo' (modo despacho); sin el filtro a veces se leía
+    # esa fila, no era JSON de mensajes y el historial salía vacío.
     result = (
         sb.table("conversaciones")
         .select("historial")
+        .eq("canal", canal)
         .eq("canal_id", canal_id_str)
         .execute()
     )

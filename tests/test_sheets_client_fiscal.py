@@ -170,3 +170,20 @@ def test_save_pending_default_sigue_siendo_anb_revision(fake_db):
     table_name, row, _ = fake_db.writes[-1]
     assert row["tipo_aprobacion"] == "anb_revision"
     assert "canal_id_aprobador" not in row
+
+
+def test_load_history_ignora_la_fila_del_emisor_activo(monkeypatch):
+    """Modo despacho: el chat tiene 2 filas en conversaciones (telegram y
+    emisor_activo). Leer la del emisor dejaba el historial vacío en cada
+    mensaje: el bot olvidaba el PDF y lo que acababa de decir."""
+    import json
+    historial = json.dumps([{"role": "user", "content": "hola"}, {"role": "assistant", "content": "¿Qué facturamos?"}])
+    db = FakeSupabase({"conversaciones": [
+        {"canal": "emisor_activo", "canal_id": "777", "historial": "7"},
+        {"canal": "telegram", "canal_id": "777", "historial": historial},
+    ]})
+    monkeypatch.setattr(sheets_client, "_get_supabase", lambda: db)
+
+    assert sheets_client.load_history("777") == [
+        {"role": "user", "content": "hola"}, {"role": "assistant", "content": "¿Qué facturamos?"},
+    ]
