@@ -327,7 +327,24 @@ def update_pending_status(invoice_id: str, estado: str) -> None:
     ).eq("id", invoice_id).execute()
 
 
+def tomar_pendiente(invoice_id: str, estado: str) -> bool:
+    """Pasa el pendiente de 'pendiente' a `estado` en un solo UPDATE condicional.
+    Devuelve False si otro proceso ya lo tomó (doble clic, update repetido):
+    quien recibe False NO debe timbrar."""
+    sb = _get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    result = (
+        sb.table("pendientes")
+        .update({"estado": estado, "timestamp_respuesta": now})
+        .eq("id", invoice_id)
+        .eq("estado", "pendiente")
+        .execute()
+    )
+    return bool(result.data)
+
+
 def get_overdue_pending(hours: int = 24) -> list[dict]:
+    """Pendientes de más de `hours` que no se han avisado en las últimas `hours`."""
     sb = _get_supabase()
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     result = (
@@ -335,9 +352,39 @@ def get_overdue_pending(hours: int = 24) -> list[dict]:
         .select("*")
         .eq("estado", "pendiente")
         .lt("timestamp", cutoff)
+        .or_(f"notificado_at.is.null,notificado_at.lt.{cutoff}")
+        .order("timestamp")
         .execute()
     )
     return result.data or []
+
+
+def marcar_notificados(invoice_ids: list[str]) -> None:
+    if not invoice_ids:
+        return
+    sb = _get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("pendientes").update({"notificado_at": now}).in_("id", invoice_ids).execute()
+
+
+def limpiar_updates_viejos(dias: int = 7) -> None:
+    """Telegram solo reintenta un update por unas horas: lo viejo sobra."""
+    sb = _get_supabase()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+    sb.table("telegram_updates").delete().lt("recibido", cutoff).execute()
+
+
+def registrar_update(update_id: int) -> bool:
+    """Registra el update_id de Telegram. False si ya se había recibido
+    (Telegram lo reenvió): el webhook lo descarta."""
+    sb = _get_supabase()
+    try:
+        sb.table("telegram_updates").insert({"update_id": update_id}).execute()
+    except Exception as exc:
+        if "23505" in str(exc) or "duplicate key" in str(exc):
+            return False
+        raise
+    return True
 
 
 def is_message_already_processed(canal_id: str, telegram_message_id: int) -> bool:
@@ -417,14 +464,17 @@ def get_bitacora_por_folio(
     return result.data[0] if result.data else None
 
 
-def update_bitacora_estado(bitacora_id: str, estado: str, error_detalle: str = "") -> None:
-    """estado: 'cancelado' o 'cancelacion_pendiente'. Un REP cancelado deja de
-    contar en get_rep_history (filtra estado='timbrado')."""
+def update_bitacora_estado(bitacora_id: str, estado: str, error_detalle: str = "") -> bool:
+    """Cambia solo el estado (y el detalle de error) sin tocar el resto del
+    registro — ej. 'cancelado', 'cancelacion_pendiente', 'rechazado'. Un REP
+    cancelado deja de contar en get_rep_history (filtra estado='timbrado').
+    Devuelve False si no existía el registro."""
     sb = _get_supabase()
     row = {"estado": estado}
     if error_detalle:
         row["error_detalle"] = error_detalle
-    sb.table("bitacora").update(row).eq("id", bitacora_id).execute()
+    result = sb.table("bitacora").update(row).eq("id", bitacora_id).execute()
+    return bool(result.data)
 
 
 def get_rep_history(uuid_factura_origen: str) -> list[dict]:

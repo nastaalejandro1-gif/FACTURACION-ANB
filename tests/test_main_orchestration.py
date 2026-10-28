@@ -89,8 +89,10 @@ async def test_clave_nueva_escala_a_anb_sin_llamar_fiscal_engine(monkeypatch):
     sent, saved_pending, _ = _patch_common(monkeypatch)
 
     def boom(*a, **kw):
-        raise AssertionError("no debería llamarse get_fiscal_rules cuando hay clave NUEVA")
-    monkeypatch.setattr(main.sheets_client, "get_fiscal_rules", boom)
+        raise AssertionError("no debería calcularse la factura cuando hay clave NUEVA")
+    monkeypatch.setattr(main.fiscal_engine, "calcular_factura", boom)
+    # Las reglas sí se leen: definen si se ofrece "Aprobar con IEPS".
+    monkeypatch.setattr(main.sheets_client, "get_fiscal_rules", lambda *a, **kw: REGLAS)
 
     draft = _draft("NUEVA", clave_propuesta="90111500")
     await main._calcular_y_procesar_factura("inv-1", draft, CLIENT_PROFILE, "555", 1)
@@ -441,3 +443,69 @@ def test_monto_maximo_default_es_50k():
         retencion_iva_tasa=Decimal("0"), retencion_isr_tasa=Decimal("0"),
         ieps_tasa=Decimal("0"), claves_con_ieps=frozenset(),
     ).monto_maximo_sin_autorizacion == Decimal("50000")
+
+
+@pytest.mark.asyncio
+async def test_rechazar_solo_cambia_el_estado_de_la_bitacora(monkeypatch):
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(main.sheets_client, "get_pending", lambda invoice_id: _pending_anb(_draft("78101803")))
+    monkeypatch.setattr(main.sheets_client, "update_pending_status", lambda *a: None)
+    cambios = []
+    monkeypatch.setattr(
+        main.sheets_client, "update_bitacora_estado", lambda bid, estado: cambios.append((bid, estado)) or True
+    )
+
+    def no_pisar(**kw):
+        raise AssertionError("no debe reescribir el registro original (RFC emisor, etc.)")
+    monkeypatch.setattr(main.sheets_client, "log_to_bitacora", no_pisar)
+
+    msg = await main._execute_approval("rechazar", "inv-9")
+
+    assert "rechazado" in msg
+    assert cambios == [("inv-9", "rechazado")]
+
+
+REGLAS_CON_IEPS = main.fiscal_engine.FiscalRules(
+    iva_aplica=True, tasa_iva=Decimal("0.16"),
+    retencion_iva_tasa=Decimal("0"), retencion_isr_tasa=Decimal("0"),
+    ieps_tasa=Decimal("0.08"), claves_con_ieps=frozenset(),
+)
+
+
+def test_botones_clave_nueva_ofrecen_ieps_solo_si_el_cliente_lo_causa():
+    _, sin = main._botones_revision_anb("inv-1", "clave_prod_serv_nueva", "", Decimal("0"))
+    _, con = main._botones_revision_anb("inv-1", "clave_prod_serv_nueva", "", Decimal("0.08"))
+    assert "aprobar_ieps" not in str(sin)
+    assert "aprobar_ieps:inv-1" in str(con) and "IEPS 8%" in str(con)
+    _, otra = main._botones_revision_anb("inv-1", "validacion_aritmetica", "", Decimal("0.08"))
+    assert "aprobar_ieps" not in str(otra)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("comando, esperado", [("aprobar", False), ("aprobar_ieps", True)])
+async def test_aprobar_clave_nueva_guarda_aplica_ieps_segun_el_boton(monkeypatch, comando, esperado):
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(main.sheets_client, "get_fiscal_rules", lambda *a, **kw: REGLAS_CON_IEPS)
+    monkeypatch.setattr(
+        main.sheets_client, "get_pending",
+        lambda invoice_id: _pending_anb(_draft("NUEVA", "90111500"), reason="clave_prod_serv_nueva"),
+    )
+    monkeypatch.setattr(main.sheets_client, "get_client_by_canal_id", lambda canal, cid: CLIENT_PROFILE)
+    monkeypatch.setattr(main.sheets_client, "update_pending_status", lambda *a: None)
+    guardadas = []
+    monkeypatch.setattr(main.sheets_client, "save_clave_aprobada", lambda **kw: guardadas.append(kw))
+
+    await main._execute_approval(comando, "inv-9")
+
+    assert [g["aplica_ieps"] for g in guardadas] == [esperado]
+
+
+@pytest.mark.asyncio
+async def test_comando_aprobar_con_palabra_ieps(monkeypatch):
+    llamadas = []
+
+    async def fake(command, invoice_id, saldo=None, parcialidad=None):
+        llamadas.append((command, invoice_id))
+    monkeypatch.setattr(main, "_execute_approval", fake)
+    await main.handle_approval_command(str(main.ALEJANDRO_CHAT_ID), 1, "/aprobar inv-9 ieps")
+    assert llamadas == [("aprobar_ieps", "inv-9")]

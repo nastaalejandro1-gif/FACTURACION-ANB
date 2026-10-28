@@ -195,15 +195,25 @@ def test_webhook_accepts_correct_secret(monkeypatch):
     from main import app
 
     # Mock process_update so it doesn't actually call anything
-    monkeypatch.setattr("main.process_update", lambda update: None)
+    procesados = []
+    monkeypatch.setattr("main.process_update", lambda update: procesados.append(update["update_id"]))
+    vistos = set()
+
+    def registrar(update_id):
+        nuevo = update_id not in vistos
+        vistos.add(update_id)
+        return nuevo
+    monkeypatch.setattr("main.sheets_client.registrar_update", registrar)
 
     client = TestClient(app)
-    response = client.post(
-        "/webhook",
-        json={"update_id": 1},
-        headers={"X-Telegram-Bot-Api-Secret-Token": "test-secret"},
-    )
-    assert response.status_code == 200
+    for _ in range(2):  # Telegram reenvía el mismo update
+        response = client.post(
+            "/webhook",
+            json={"update_id": 1},
+            headers={"X-Telegram-Bot-Api-Secret-Token": "test-secret"},
+        )
+        assert response.status_code == 200
+    assert procesados == [1]
 
 
 # ---------------------------------------------------------------------------

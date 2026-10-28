@@ -1,9 +1,11 @@
 import asyncio
 import html
+from collections import defaultdict, deque
 import json
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -69,8 +71,47 @@ async def webhook(
         raise HTTPException(status_code=403, detail="Forbidden")
 
     update = await request.json()
+    update_id = update.get("update_id")
+    if update_id is not None:
+        try:
+            nuevo = await asyncio.to_thread(sheets_client.registrar_update, int(update_id))
+        except Exception:
+            # Si Supabase falla se procesa igual: perder el mensaje es peor, y
+            # los pendientes se toman con tomar_pendiente (no se timbra dos veces).
+            logger.exception("No se pudo registrar el update %s", update_id)
+            nuevo = True
+        if not nuevo:
+            logger.info("Update %s repetido por Telegram, ignorado", update_id)
+            return {"ok": True}
     background_tasks.add_task(process_update, update)
     return {"ok": True}
+
+
+# Límite por chat para proteger el costo de Claude (un bucle o alguien
+# mandando mensajes sin parar). En memoria: el bot corre en una sola réplica.
+LIMITE_MENSAJES = 20
+VENTANA_LIMITE_SEG = 600
+_mensajes_recientes: dict[str, deque] = defaultdict(deque)
+_ultimo_aviso_limite: dict[str, float] = {}
+MAX_ARCHIVO_BYTES = 10_000_000  # una cotización o CSF real pesa mucho menos
+
+
+def _excede_limite(chat_id: str) -> tuple[bool, bool]:
+    """(excede, avisar). Alejandro no tiene límite; el aviso sale una sola vez
+    por ventana para no responder a cada mensaje del bucle."""
+    if int(chat_id) == ALEJANDRO_CHAT_ID:
+        return False, False
+    ahora = time.monotonic()
+    recientes = _mensajes_recientes[chat_id]
+    while recientes and ahora - recientes[0] > VENTANA_LIMITE_SEG:
+        recientes.popleft()
+    if len(recientes) >= LIMITE_MENSAJES:
+        avisar = ahora - _ultimo_aviso_limite.get(chat_id, float("-inf")) > VENTANA_LIMITE_SEG
+        if avisar:
+            _ultimo_aviso_limite[chat_id] = ahora
+        return True, avisar
+    recientes.append(ahora)
+    return False, False
 
 
 async def process_update(update: dict) -> None:
@@ -110,6 +151,20 @@ async def process_update(update: dict) -> None:
             return
         if text.startswith(("/permiso", "/quitar", "/socios")) and int(chat_id) == ALEJANDRO_CHAT_ID:
             await handle_admin_operadores(text)
+            return
+
+        excede, avisar = _excede_limite(chat_id)
+        if excede:
+            if avisar:
+                await telegram_client.send_message(
+                    chat_id,
+                    "Recibí muchos mensajes seguidos. Espera unos minutos y vuelve a escribirme, por favor. 🙏",
+                )
+                await telegram_client.send_message(
+                    ALEJANDRO_CHAT_ID,
+                    f"⚠️ El chat {chat_id} mandó más de {LIMITE_MENSAJES} mensajes en "
+                    f"{VENTANA_LIMITE_SEG // 60} minutos; se pausaron sus respuestas.",
+                )
             return
 
         # Modo despacho: Alejandro o un socio factura a nombre de los clientes
@@ -207,6 +262,13 @@ async def handle_conversation(
 
     try:
         if message.get("document"):
+            if int(message["document"].get("file_size") or 0) > MAX_ARCHIVO_BYTES:
+                await telegram_client.send_message(
+                    chat_id,
+                    f"El archivo pesa más de {MAX_ARCHIVO_BYTES // 1_000_000} MB y no lo puedo leer. "
+                    "Mándame uno más ligero o escríbeme los datos, por favor.",
+                )
+                return
             file_id = message["document"]["file_id"]
             mime = message["document"].get("mime_type", "application/octet-stream")
             nombre_archivo = (message["document"].get("file_name") or "").lower()
@@ -287,7 +349,7 @@ async def handle_conversation(
         except Exception:
             logger.exception("Error guardando historial para %s", chat_id)
 
-    await telegram_client.send_message(chat_id, client_message)
+    await telegram_client.send_message(chat_id, telegram_client.markdown_a_html(client_message))
 
     if invoice_draft:
         invoice_id = str(uuid.uuid4())
@@ -525,6 +587,10 @@ async def _calcular_y_procesar_factura(
     si se escaló a ANB o hubo un error (ambos ya avisan por su cuenta).
     """
     operador = bool(client_profile.operador_canal_id)
+    claves_al_vuelo = [
+        c.clave_prod_serv_propuesta for c in draft.factura.conceptos
+        if operador and c.clave_prod_serv == tools.CLAVE_NUEVA and c.clave_prod_serv_propuesta
+    ]
     if operador:
         # Modo despacho: la confirmación del socio basta (no hay revisión de
         # ANB). Una clave nueva se aprueba al vuelo y queda en el catálogo.
@@ -590,6 +656,12 @@ async def _calcular_y_procesar_factura(
             draft.factura.metodo_pago, draft.factura.forma_pago,
             omitir_validacion_cruzada=True,
         )
+    if claves_al_vuelo and reglas.ieps_tasa > 0:
+        aviso_ieps = (
+            f"La clave nueva {', '.join(claves_al_vuelo)} se guardó SIN IEPS. Si ese producto "
+            "lleva IEPS, responde No y avisa a Alejandro para corregirla."
+        )
+        advertencia = f"{advertencia}\n{aviso_ieps}" if advertencia else aviso_ieps
 
     if resultado.escalation:
         envelope = PendingPayload(
@@ -616,8 +688,11 @@ async def _calcular_y_procesar_factura(
     return invoice_data
 
 
-async def _aprobar_claves_nuevas(draft: InvoiceDraft, client_profile, aprobada_por: str) -> InvoiceDraft:
-    """Cambia cada clave NUEVA por su propuesta y la guarda en el catálogo del cliente."""
+async def _aprobar_claves_nuevas(
+    draft: InvoiceDraft, client_profile, aprobada_por: str, aplica_ieps: bool = False,
+) -> InvoiceDraft:
+    """Cambia cada clave NUEVA por su propuesta y la guarda en el catálogo del
+    cliente. aplica_ieps: lo decide ANB con el botón "Aprobar con IEPS"."""
     if not any(c.clave_prod_serv == tools.CLAVE_NUEVA for c in draft.factura.conceptos):
         return draft
     draft = draft.model_copy(deep=True)
@@ -629,7 +704,7 @@ async def _aprobar_claves_nuevas(draft: InvoiceDraft, client_profile, aprobada_p
                 id_cliente=client_profile.id_cliente,
                 clave_prod_serv=c.clave_prod_serv_propuesta,
                 descripcion_clave=c.descripcion,
-                aplica_ieps=False,  # ANB puede corregir esto en Supabase si el concepto sí lleva IEPS
+                aplica_ieps=aplica_ieps,
                 aprobada_por=aprobada_por,
             )
             c.clave_prod_serv = c.clave_prod_serv_propuesta
@@ -720,25 +795,56 @@ def _detalle_para_revision(
     return "\n".join(lineas)
 
 
-def _botones_revision_anb(invoice_id: str, motivo: str, clave_default: str) -> tuple[str, dict]:
+def _botones_revision_anb(
+    invoice_id: str, motivo: str, clave_default: str, ieps_tasa: Decimal = Decimal("0"),
+) -> tuple[str, dict]:
     """
     Comandos y botones de la revisión de ANB. En una clave nueva se agrega
-    la tercera opción: no aprobar la propuesta y usar la clave predeterminada
-    del cliente.
+    la opción de usar la clave predeterminada del cliente y, si el cliente
+    causa IEPS, la de aprobarla con IEPS (si no, se guarda sin IEPS).
     """
-    comandos = f"/aprobar {invoice_id}\n/rechazar {invoice_id}"
-    fila = [
-        {"text": "✅ Aprobar", "callback_data": f"aprobar:{invoice_id}"},
-        {"text": "❌ Rechazar", "callback_data": f"rechazar:{invoice_id}"},
-    ]
-    teclado = [fila]
-    if motivo == EscalationReason.CLAVE_PROD_SERV_NUEVA.value and clave_default:
+    clave_nueva = motivo == EscalationReason.CLAVE_PROD_SERV_NUEVA.value
+    if clave_nueva and ieps_tasa > 0:
+        tasa = f"{(ieps_tasa * 100).normalize():f}%"
+        comandos = (
+            f"/aprobar {invoice_id} (sin IEPS)\n/aprobar {invoice_id} ieps (con IEPS {tasa})\n"
+            f"/rechazar {invoice_id}"
+        )
+        teclado = [
+            [
+                {"text": "✅ Aprobar sin IEPS", "callback_data": f"aprobar:{invoice_id}"},
+                {"text": f"✅ Aprobar con IEPS {tasa}", "callback_data": f"aprobar_ieps:{invoice_id}"},
+            ],
+            [{"text": "❌ Rechazar", "callback_data": f"rechazar:{invoice_id}"}],
+        ]
+    else:
+        comandos = f"/aprobar {invoice_id}\n/rechazar {invoice_id}"
+        teclado = [[
+            {"text": "✅ Aprobar", "callback_data": f"aprobar:{invoice_id}"},
+            {"text": "❌ Rechazar", "callback_data": f"rechazar:{invoice_id}"},
+        ]]
+    if clave_nueva and clave_default:
         comandos += f"\n/predeterminada {invoice_id} (usar {clave_default})"
         teclado.append([{
             "text": f"🔁 Usar clave predeterminada ({clave_default})",
             "callback_data": f"predeterminada:{invoice_id}",
         }])
     return comandos, {"inline_keyboard": teclado}
+
+
+async def _ieps_tasa_si_clave_nueva(motivo: str, client_profile) -> Decimal:
+    """Tasa de IEPS del cliente cuando hay que aprobar una clave nueva (0 si
+    no causa IEPS o no hay reglas): define si se ofrece "Aprobar con IEPS"."""
+    if motivo != EscalationReason.CLAVE_PROD_SERV_NUEVA.value or client_profile is None:
+        return Decimal("0")
+    try:
+        reglas = await asyncio.to_thread(
+            sheets_client.get_fiscal_rules, client_profile.despacho_id, client_profile.id_cliente
+        )
+    except Exception:
+        logger.exception("Sin reglas fiscales para ofrecer IEPS (%s)", client_profile.id_cliente)
+        return Decimal("0")
+    return reglas.ieps_tasa
 
 
 async def _escalar_a_anb(
@@ -763,7 +869,8 @@ async def _escalar_a_anb(
     )
     tipo_texto = "REP" if envelope.tipo == "rep" else "Factura"
     comandos, teclado = _botones_revision_anb(
-        invoice_id, envelope.escalation_reason, client_profile.clave_prod_serv_default
+        invoice_id, envelope.escalation_reason, client_profile.clave_prod_serv_default,
+        await _ieps_tasa_si_clave_nueva(envelope.escalation_reason, client_profile),
     )
     await telegram_client.send_message(
         ALEJANDRO_CHAT_ID,
@@ -1450,6 +1557,15 @@ async def _timbre_and_deliver_rep(
 # Aprobación de ANB (/aprobar, /rechazar) — solo para escalamientos
 # ---------------------------------------------------------------------------
 
+async def _tomar_pendiente(pending_id: str, estado: str) -> bool:
+    """Toma el pendiente (pendiente -> estado) de forma atómica. False = otro
+    clic o un update repetido ya lo tomó: no se debe timbrar otra vez."""
+    tomado = await asyncio.to_thread(sheets_client.tomar_pendiente, pending_id, estado)
+    if not tomado:
+        logger.info("Pendiente %s ya tomado por otro proceso (quería %s)", pending_id, estado)
+    return tomado
+
+
 async def _execute_approval(
     command: str, invoice_id: str, saldo: Optional[Decimal] = None, parcialidad: Optional[int] = None,
 ) -> str:
@@ -1499,12 +1615,19 @@ async def _execute_approval(
     es_rep = envelope.tipo == "rep"
 
     if command == "rechazar":
-        await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "rechazado")
+        if not await _tomar_pendiente(pending["id"], "rechazado"):
+            msg = f"La solicitud {invoice_id} ya fue procesada. No se timbró de nuevo."
+            await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+            return msg
         await telegram_client.send_message(
             client_canal_id,
             "Tu solicitud no pudo procesarse. El despacho te contactará para más información."
         )
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"✅ {'REP' if es_rep else 'Factura'} {invoice_id} rechazado.")
+        # Solo cambia el estado: el registro de la escalación conserva el RFC
+        # del emisor y demás datos. Se crea solo si no existía.
+        if await asyncio.to_thread(sheets_client.update_bitacora_estado, invoice_id, "rechazado"):
+            return f"{'REP' if es_rep else 'Factura'} rechazado."
         await asyncio.to_thread(
             sheets_client.log_to_bitacora,
             invoice_id=invoice_id, canal_id=client_canal_id,
@@ -1523,6 +1646,12 @@ async def _execute_approval(
             f"⚠️ No encontré el perfil del cliente (canal_id: {client_canal_id}). "
             "No se puede timbrar sin la API key de FacturAPI."
         )
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+        return msg
+
+    con_ieps = command == "aprobar_ieps"
+    if con_ieps and envelope.escalation_reason != EscalationReason.CLAVE_PROD_SERV_NUEVA.value:
+        msg = f"\"Aprobar con IEPS\" solo aplica a una clave nueva ({invoice_id} no es el caso)."
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
         return msg
 
@@ -1554,7 +1683,10 @@ async def _execute_approval(
             saldo_inicial=str(saldo), parcialidades_previas=parcialidad - 1, saldo_confirmado=True
         )
 
-    await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "aprobado")
+    if not await _tomar_pendiente(pending["id"], "aprobado"):
+        msg = f"La solicitud {invoice_id} ya fue procesada. No se timbró de nuevo."
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+        return msg
     nuevo_invoice_id = str(uuid.uuid4())
 
     if es_rep:
@@ -1577,7 +1709,7 @@ async def _execute_approval(
                 c.clave_prod_serv_propuesta = ""
         omitir_validacion = False
     elif envelope.escalation_reason == EscalationReason.CLAVE_PROD_SERV_NUEVA.value:
-        draft = await _aprobar_claves_nuevas(draft, client_profile, "ALEJANDRO")
+        draft = await _aprobar_claves_nuevas(draft, client_profile, "ALEJANDRO", aplica_ieps=con_ieps)
         omitir_validacion = False  # ya no hay "NUEVA" en el draft, no hace falta omitir nada
 
     await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⏳ Recalculando {invoice_id}...")
@@ -1620,6 +1752,8 @@ async def handle_approval_command(chat_id: str, message_id: int, text: str) -> N
 
     command = parts[0].lower().lstrip("/")
     invoice_id = parts[1]
+    if command == "aprobar" and any(p.lower() == "ieps" for p in parts[2:]):
+        command = "aprobar_ieps"
     opciones = dict(p.split("=", 1) for p in parts[2:] if "=" in p)
     try:
         saldo = Decimal(opciones["saldo"].replace(",", "").lstrip("$")) if "saldo" in opciones else None
@@ -1647,7 +1781,8 @@ async def _execute_client_confirmation(command: str, invoice_id: str, pending: d
     chat_id = str(pending["canal_id"])
 
     if command == "cliente_no":
-        await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "rechazado_cliente")
+        if not await _tomar_pendiente(pending["id"], "rechazado_cliente"):
+            return
         await telegram_client.send_message(chat_id, "Entendido, mándame los datos corregidos cuando quieras.")
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"ℹ️ El cliente no confirmó su vista previa: {invoice_id}")
         return
@@ -1679,7 +1814,8 @@ async def _execute_client_confirmation(command: str, invoice_id: str, pending: d
         # puede saber el saldo real, lo fija ANB después de hablar con el cliente.
         if not es_rep:
             return
-        await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "pagos_previos")
+        if not await _tomar_pendiente(pending["id"], "pagos_previos"):
+            return
         nuevo_id = str(uuid.uuid4())
         draft = RepDraft(
             estatus="confirmado_por_cliente",
@@ -1705,7 +1841,8 @@ async def _execute_client_confirmation(command: str, invoice_id: str, pending: d
         await _escalar_a_anb(nuevo_id, chat_id, message_id, client_profile, envelope)
         return
 
-    await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "aprobado")
+    if not await _tomar_pendiente(pending["id"], "aprobado"):
+        return
 
     if es_rep:
         facturapi_key = client_profile.facturapi_key if client_profile else ""
@@ -1749,7 +1886,7 @@ async def handle_callback_query(callback_query: dict) -> None:
     data = callback_query.get("data", "")
     command, _, invoice_id = data.partition(":")
 
-    if command in ("aprobar", "rechazar", "predeterminada"):
+    if command in ("aprobar", "aprobar_ieps", "rechazar", "predeterminada"):
         if not chat_id or int(chat_id) != ALEJANDRO_CHAT_ID:
             logger.warning("Callback de aprobación de ANB de chat no autorizado: %s", chat_id)
             await telegram_client.answer_callback_query(callback_id)
@@ -1907,13 +2044,15 @@ async def _execute_cancelacion(command: str, pending_id: str, pending: dict, cli
     tipo_texto = "REP" if datos.get("tipo") == "rep" else "factura"
 
     if command == "cancelar_no":
-        await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "rechazado_cliente")
+        if not await _tomar_pendiente(pending["id"], "rechazado_cliente"):
+            return
         await telegram_client.send_message(chat_id, f"Listo, no se canceló la {tipo_texto}.")
         return
 
     # Se marca ANTES de llamar a FacturAPI: un doble clic no debe mandar
     # dos solicitudes de cancelación.
-    await asyncio.to_thread(sheets_client.update_pending_status, pending["id"], "aprobado")
+    if not await _tomar_pendiente(pending["id"], "aprobado"):
+        return
     try:
         result = await cancel_invoice(datos["folio"], datos["motivo"], client_profile.facturapi_key)
     except (httpx.HTTPStatusError, httpx.RequestError) as exc:
@@ -1960,57 +2099,97 @@ async def check_pending(x_cron_secret: Optional[str] = Header(None)):
     if x_cron_secret != CRON_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    try:
+        await asyncio.to_thread(sheets_client.limpiar_updates_viejos)
+    except Exception:
+        logger.exception("No se pudieron limpiar los telegram_updates viejos")
+
+    # Un solo resumen por corrida, y cada pendiente se repite como mucho una
+    # vez cada 24h (pendientes.notificado_at).
     overdue = await asyncio.to_thread(sheets_client.get_overdue_pending, 24)
     if not overdue:
         return {"checked": 0}
 
+    revisiones: list[str] = []
+    sin_confirmar: list[str] = []
+    sin_xml: list[str] = []
+    teclado: list[list[dict]] = []
     for row in overdue:
-        invoice_id = row.get("id", "?")
+        invoice_id = str(row.get("id", "?"))
         tipo_aprobacion = str(row.get("tipo_aprobacion", "anb_revision"))
-        canal_id = row.get("canal_id", "?")
-        motivo = row.get("motivo_revision", "")
-
-        if tipo_aprobacion == "esperando_xml_origen":
-            await telegram_client.send_message(
-                ALEJANDRO_CHAT_ID,
-                f"ℹ️ El cliente (canal_id: {canal_id}) no ha mandado en más de 24h el XML de la "
-                f"factura externa para su REP ({invoice_id}). Puedes darle seguimiento manual."
-            )
-            continue
-
         if tipo_aprobacion == "cliente_cancelacion":
             # El cliente no confirmó su propia cancelación: no hay nada que
             # aprobar del lado de ANB y la factura sigue vigente.
             continue
 
-        if tipo_aprobacion == "cliente_confirmacion":
-            # No son botones de ANB -- solo un aviso informativo, sin
-            # acción: forzar el timbrado aquí saltaría la confirmación
-            # del cliente.
-            await telegram_client.send_message(
-                ALEJANDRO_CHAT_ID,
-                f"ℹ️ El cliente (canal_id: {canal_id}) no ha confirmado su factura "
-                f"{invoice_id} en más de 24h. Puedes darle seguimiento manual."
-            )
-            continue
+        try:
+            datos = json.loads(row.get("invoice_json") or "{}")
+        except (TypeError, ValueError):
+            datos = {}
+        perfil = await _perfil_de_pendiente(row, _id_emisor_de_pendiente(datos))
+        cliente = html.escape(perfil.nombre_comercial if perfil else f"chat {row.get('canal_id', '?')}")
+        desde = _hace_cuanto(str(row.get("timestamp", "")))
 
-        # motivo_revision se guarda como "[razón] detalle" (ver _escalar_a_anb)
-        razon = motivo[1:].partition("]")[0] if motivo.startswith("[") else ""
-        clave_default = ""
-        if razon == EscalationReason.CLAVE_PROD_SERV_NUEVA.value:
-            try:
-                id_emisor = str(json.loads(row.get("invoice_json") or "{}").get("id_cliente_emisor", ""))
-            except (TypeError, ValueError):
-                id_emisor = ""
-            perfil = await _perfil_de_pendiente(row, id_emisor)
-            clave_default = perfil.clave_prod_serv_default if perfil else ""
-        comandos, teclado = _botones_revision_anb(invoice_id, razon, clave_default)
+        if tipo_aprobacion == "esperando_xml_origen":
+            sin_xml.append(f"• {cliente} — {desde} (REP {invoice_id})")
+        elif tipo_aprobacion == "cliente_confirmacion":
+            # Solo informativo: forzar el timbrado aquí saltaría la
+            # confirmación del cliente.
+            sin_confirmar.append(f"• {cliente} — {desde} ({invoice_id})")
+        else:
+            motivo = str(row.get("motivo_revision", ""))
+            # motivo_revision se guarda como "[razón] detalle" (ver _escalar_a_anb)
+            razon = motivo[1:].partition("]")[0] if motivo.startswith("[") else ""
+            comandos, botones = _botones_revision_anb(
+                invoice_id, razon, perfil.clave_prod_serv_default if perfil else "",
+                await _ieps_tasa_si_clave_nueva(razon, perfil),
+            )
+            revisiones.append(
+                f"• <b>{cliente}</b> — {desde}\n  {html.escape(motivo[:200])}\n  {html.escape(comandos).replace(chr(10), chr(10) + '  ')}"
+            )
+            if len(teclado) < MAX_FILAS_TECLADO_RESUMEN:
+                corto = invoice_id[:8]
+                teclado += [
+                    [{**b, "text": f"{b['text']} · {cliente[:15]} {corto}"} for b in fila]
+                    for fila in botones["inline_keyboard"]
+                ]
+
+    secciones = []
+    if revisiones:
+        secciones.append(f"<b>Por revisar ({len(revisiones)}):</b>\n" + "\n\n".join(revisiones))
+    if sin_confirmar:
+        secciones.append(
+            f"<b>El cliente no ha confirmado ({len(sin_confirmar)}):</b>\n" + "\n".join(sin_confirmar)
+        )
+    if sin_xml:
+        secciones.append(f"<b>Falta el XML de la factura externa ({len(sin_xml)}):</b>\n" + "\n".join(sin_xml))
+    if secciones:
         await telegram_client.send_message(
             ALEJANDRO_CHAT_ID,
-            f"⚠️ Solicitud sin revisión hace más de 24h\n"
-            f"ID: {invoice_id}\nCliente canal_id: {canal_id}\nMotivo: {motivo}\n\n"
-            f"{comandos}",
-            reply_markup=teclado,
+            "🗂️ <b>Pendientes de más de 24h</b>\n\n" + "\n\n".join(secciones),
+            reply_markup={"inline_keyboard": teclado} if teclado else None,
         )
-
+    await asyncio.to_thread(sheets_client.marcar_notificados, [str(r["id"]) for r in overdue if r.get("id")])
     return {"checked": len(overdue)}
+
+
+MAX_FILAS_TECLADO_RESUMEN = 30  # los demás se aprueban con los comandos del texto
+
+
+def _id_emisor_de_pendiente(datos: dict) -> str:
+    """Modo despacho: id del cliente a cuyo nombre factura el socio (vacío si
+    lo pidió el propio cliente). Cada tipo de pendiente lo guarda distinto."""
+    return str(
+        datos.get("id_cliente_emisor")
+        or (datos.get("emisor") or {}).get("id_cliente")
+        or ""
+    )
+
+
+def _hace_cuanto(timestamp: str) -> str:
+    try:
+        creado = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return "hace más de 24h"
+    horas = int((datetime.now(timezone.utc) - creado).total_seconds() // 3600)
+    return f"hace {horas // 24} días" if horas >= 48 else f"hace {horas} h"

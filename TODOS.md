@@ -70,10 +70,9 @@ clasifica, el código calcula (Decimal, tolerancia cero). Migrado a producción 
       de 82 mensajes acumulados — coincide con lo reportado). Corregido con `history.clear()`
       después de un tool_use exitoso + `/start` como reinicio explícito. Logging permanente de
       costo por llamada (`claude_usage` en los logs de Railway) para monitorear esto en vivo.
-- [ ] **Revisar `aplica_ieps` de claves nuevas aprobadas** — hoy el botón "Aprobar" de
-      ANB siempre guarda `aplica_ieps=False` por default (más seguro que sobre-cobrar);
-      si una clave nueva SÍ lleva IEPS, hay que corregirlo a mano en Supabase después de
-      aprobar.
+- [x] **`aplica_ieps` de claves nuevas aprobadas** (28 oct 2026) — si el cliente causa IEPS,
+      la revisión de ANB trae "Aprobar sin IEPS" / "Aprobar con IEPS" (`/aprobar {id} ieps`).
+      Los socios (aprueban al vuelo) ven un aviso en el resumen de que se guardó sin IEPS.
 - [x] **Push a origin/main + deploy** — pusheado (714c260).
 - [x] **Catálogo de regímenes mal etiquetado** (oct 2026) — 621 decía "RESICO PF" y 626
       "RESICO PM"; oficialmente 621 = RIF y 626 = RESICO para PF y PM. Claude mapeaba CSFs de
@@ -97,26 +96,29 @@ clasifica, el código calcula (Decimal, tolerancia cero). Migrado a producción 
 ## Fase 3
 
 - [ ] Email de entrega (XML + PDF) vía Resend — ya está el código, solo falta configurar RESEND_API_KEY en Railway
+      (en pausa, oct 2026: los clientes reciben todo por WhatsApp/Telegram)
 - [ ] Dashboard de facturas para Alejandro
 - [ ] Cache de ClaveProdServ por cliente (después de ver patrones en producción)
 
 ## Pendientes de la auditoría (jun 2026) — antes de crecer
 
-- [ ] Deduplicar updates de Telegram por update_id (hoy un update reentregado puede duplicar una factura de auto-timbre)
+- [x] Deduplicar updates de Telegram (28 oct 2026) — tabla `telegram_updates` por update_id +
+      `tomar_pendiente` (UPDATE ... WHERE estado='pendiente') en cada aprobación/confirmación/cancelación:
+      un doble clic ya no puede timbrar dos veces.
 - [x] REP con sobrepago → escala (VALIDACION_ARITMETICA) en vez de recortar el saldo a 0 — hecho en Fase 4
-- [ ] Cron /check-pending: marcar notificado o mandar un solo resumen (hoy re-notifica todo en cada corrida)
+- [x] Cron /check-pending (28 oct 2026): un solo resumen; cada pendiente se repite como mucho cada 24h
+      (`pendientes.notificado_at`).
 - [x] Claude tool use paralelo — corregido: disable_parallel_tool_use en la llamada principal +
       tool_choice="none" en la llamada de confirmación (esa NUNCA debía poder llamar una tool).
       Encontrado probando en vivo un mensaje con REP + factura nueva mezclados — sin el fix,
       la conversación quedaba rota para siempre para ese cliente.
-- [ ] Índices en Supabase (correr en SQL Editor):
-      clientes(canal, canal_id), pendientes(canal_id, telegram_message_id),
-      pendientes(estado, timestamp), bitacora(uuid_factura_origen, tipo, estado)
+- [x] Índices en Supabase (28 oct 2026) — `scripts/schema_dedup_resumen_indices.sql`.
 - [ ] NO escalar Railway a 2+ réplicas ni workers hasta migrar los locks de memoria a advisory locks de Postgres
-- [ ] Bitácora: no pisar datos del registro original al rechazar (upsert sobre el mismo id)
-- [ ] Rate limit por chat (proteger costo de Anthropic) y límite de tamaño de PDF (~10MB)
-- [ ] Formato Telegram: Claude escribe markdown pero se envía como HTML; mensajes >4096 chars fallan
-- [ ] Borrar código muerto de Google: scripts/get_refresh_token.py, scripts/test_sheets.py, vars Google en conftest.py
+- [x] Bitácora: al rechazar solo se cambia el estado (28 oct 2026)
+- [x] Límite de 20 mensajes / 10 min por chat (Alejandro exento) y archivos de máx. 10 MB (28 oct 2026)
+- [x] Formato Telegram (28 oct 2026): Markdown de Claude → HTML (`markdown_a_html`); mensajes >4096 se parten
+- [x] Borrado el código muerto de Google (28 oct 2026); `pytest` sin ruta ya funciona
+- [ ] Seguimiento de cancelaciones en `cancelacion_pendiente` (el receptor tiene 72h para aceptar)
 
 ## Pre-SaaS (antes de vender a otro despacho)
 
