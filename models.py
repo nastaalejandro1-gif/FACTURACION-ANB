@@ -174,6 +174,7 @@ class FacturaData(BaseModel):
     ieps: Decimal = Field(ge=0, default=Decimal("0"))
     iva: Decimal = Field(ge=0)
     tasa_iva: Decimal = Field(ge=0, default=Decimal("0"))
+    iva_aplica: bool = True  # con tasa_iva 0 = IVA tasa 0% (se traslada en el CFDI)
     retencion_iva: Decimal = Field(ge=0)
     retencion_iva_tasa: Decimal = Field(ge=0, default=Decimal("0"))
     retencion_isr: Decimal = Field(ge=0)

@@ -85,6 +85,9 @@ class FacturaCalculada:
     tasa_iva: Decimal
     retencion_iva: Decimal
     retencion_iva_tasa: Decimal
+    # False = sin IVA (no se traslada). True con tasa_iva 0 = IVA tasa 0%
+    # (alimentos básicos, ej. huevo): el CFDI sí lleva el traslado al 0%.
+    iva_aplica: bool
     retencion_isr: Decimal
     retencion_isr_tasa: Decimal
     total: Decimal
@@ -257,6 +260,7 @@ def calcular_factura(
         ieps=ieps_total,
         iva=iva,
         tasa_iva=tasa_iva,
+        iva_aplica=reglas.iva_aplica,
         retencion_iva=retencion_iva,
         retencion_iva_tasa=retencion_iva_tasa,
         retencion_isr=retencion_isr,

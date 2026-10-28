@@ -553,6 +553,7 @@ def _build_invoice_data(draft: InvoiceDraft, client_profile, calculada: fiscal_e
         ieps=calculada.ieps,
         iva=calculada.iva,
         tasa_iva=calculada.tasa_iva,
+        iva_aplica=calculada.iva_aplica,
         retencion_iva=calculada.retencion_iva,
         retencion_iva_tasa=calculada.retencion_iva_tasa,
         retencion_isr=calculada.retencion_isr,

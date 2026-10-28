@@ -138,7 +138,9 @@ def _build_taxes_for_concepto(concepto, data: InvoiceData, retenciones: tuple[De
             "withholding": False,
         })
 
-    if data.factura.iva > 0:
+    # Con IVA tasa 0% (alimentos básicos) también se traslada, con importe 0:
+    # mandar `taxes` sin IVA haría el concepto "no objeto de impuesto".
+    if data.factura.iva > 0 or data.factura.iva_aplica:
         taxes.append({
             "type": "IVA",
             "rate": float(data.factura.tasa_iva),

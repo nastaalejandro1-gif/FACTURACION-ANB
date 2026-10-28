@@ -275,3 +275,22 @@ def test_related_document_taxes_prorratea_pago_parcial():
     iva = taxes[0]
     assert round(iva["base"], 2) == 8620.69
     assert round(iva["base"] * iva["rate"], 2) == 1379.31
+
+
+HUEVO = ConceptoItem(
+    descripcion="Huevo blanco caja 360 pzas", clave_prod_serv="50131612",
+    cantidad=Decimal("2"), precio_unitario=Decimal("850.00"), clave_unidad="XBX",
+)
+
+
+def test_iva_tasa_cero_se_traslada_al_cero_por_ciento():
+    """Huevo (alimento básico): IVA tasa 0% — el CFDI debe llevar el traslado
+    con tasa 0, no quedar como "no objeto de impuesto"."""
+    data = _invoice([HUEVO], tasa_iva=Decimal("0"), iva_aplica=True)
+    taxes = _build_facturapi_payload(data)["items"][0]["product"]["taxes"]
+    assert taxes == [{"type": "IVA", "rate": 0.0, "factor": "Tasa", "withholding": False}]
+
+
+def test_sin_iva_no_manda_traslado():
+    data = _invoice([HUEVO], tasa_iva=Decimal("0"), iva_aplica=False)
+    assert _build_facturapi_payload(data)["items"][0]["product"]["taxes"] == []
