@@ -103,6 +103,31 @@ def strip_binary_in_place(messages: list) -> list:
 # Client profile
 # ---------------------------------------------------------------------------
 
+def _row_to_profile(row: dict, canal_id: str) -> ClientProfile:
+    return ClientProfile(
+        despacho_id=row.get("despacho_id", ""),
+        id_cliente=str(row.get("id_cliente", "")),
+        nombre_comercial=row.get("nombre_comercial", ""),
+        razon_social=row.get("razon_social", ""),
+        rfc=row.get("rfc", ""),
+        canal=row.get("canal", ""),
+        canal_id=canal_id,
+        email_factura=row.get("email_factura", ""),
+        tipo_persona=row.get("tipo_persona", "PF"),
+        regimen_fiscal=str(row.get("regimen_fiscal", "")),
+        cp_fiscal=str(row.get("cp_fiscal", "")),
+        iva_aplica=row.get("iva_aplica", "SI"),
+        retencion_iva=_to_float(row.get("retencion_iva", 0)),
+        retencion_isr=_to_float(row.get("retencion_isr", 0)),
+        ieps_rate=_to_float(row.get("ieps_rate", 0)),
+        clave_prod_serv_default=str(row.get("clave_prod_serv_default", "")),
+        requiere_revision=bool(row.get("requiere_revision", False)),
+        notas_fiscales=row.get("notas_fiscales", ""),
+        activo=True,
+        facturapi_key=row.get("facturapi_key", ""),
+    )
+
+
 def get_client_by_canal_id(canal: str, canal_id: str) -> Optional[ClientProfile]:
     sb = _get_supabase()
     canal_id_str = str(int(float(canal_id)))
@@ -119,29 +144,63 @@ def get_client_by_canal_id(canal: str, canal_id: str) -> Optional[ClientProfile]
     if not result.data:
         return None
 
-    row = result.data[0]
-    return ClientProfile(
-        despacho_id=row.get("despacho_id", ""),
-        id_cliente=str(row.get("id_cliente", "")),
-        nombre_comercial=row.get("nombre_comercial", ""),
-        razon_social=row.get("razon_social", ""),
-        rfc=row.get("rfc", ""),
-        canal=row.get("canal", ""),
-        canal_id=canal_id_str,
-        email_factura=row.get("email_factura", ""),
-        tipo_persona=row.get("tipo_persona", "PF"),
-        regimen_fiscal=str(row.get("regimen_fiscal", "")),
-        cp_fiscal=str(row.get("cp_fiscal", "")),
-        iva_aplica=row.get("iva_aplica", "SI"),
-        retencion_iva=_to_float(row.get("retencion_iva", 0)),
-        retencion_isr=_to_float(row.get("retencion_isr", 0)),
-        ieps_rate=_to_float(row.get("ieps_rate", 0)),
-        clave_prod_serv_default=str(row.get("clave_prod_serv_default", "")),
-        requiere_revision=bool(row.get("requiere_revision", False)),
-        notas_fiscales=row.get("notas_fiscales", ""),
-        activo=True,
-        facturapi_key=row.get("facturapi_key", ""),
+    return _row_to_profile(result.data[0], canal_id_str)
+
+
+# ---------------------------------------------------------------------------
+# Modo despacho: socios que facturan a nombre de los clientes (ver operadores.py)
+# ---------------------------------------------------------------------------
+
+def get_clientes_activos() -> list[tuple[ClientProfile, list[str]]]:
+    """Todas las filas activas del despacho con su lista de operadores
+    (chats de socios con permiso). Sin la columna `operadores` (antes del
+    ALTER TABLE) la lista viene vacía."""
+    sb = _get_supabase()
+    result = (
+        sb.table("clientes").select("*")
+        .eq("despacho_id", DESPACHO_ID).eq("activo", True)
+        .execute()
     )
+    return [
+        (_row_to_profile(row, str(row.get("canal_id") or "")), [str(o) for o in (row.get("operadores") or [])])
+        for row in (result.data or [])
+    ]
+
+
+def set_operadores(id_cliente: str, operadores: list[str]) -> None:
+    sb = _get_supabase()
+    sb.table("clientes").update({"operadores": operadores}).eq("despacho_id", DESPACHO_ID).eq(
+        "id_cliente", id_cliente
+    ).execute()
+
+
+# El emisor elegido por un socio se guarda como una fila más de
+# conversaciones (sin tabla nueva): canal "emisor_activo", historial = id_cliente.
+_CANAL_EMISOR_ACTIVO = "emisor_activo"
+
+
+def get_emisor_activo(canal_id: str) -> str:
+    sb = _get_supabase()
+    result = (
+        sb.table("conversaciones").select("historial")
+        .eq("canal", _CANAL_EMISOR_ACTIVO).eq("canal_id", str(int(float(canal_id))))
+        .execute()
+    )
+    return str(result.data[0].get("historial") or "") if result.data else ""
+
+
+def set_emisor_activo(canal_id: str, id_cliente: str) -> None:
+    sb = _get_supabase()
+    sb.table("conversaciones").upsert(
+        {
+            "despacho_id": DESPACHO_ID,
+            "canal": _CANAL_EMISOR_ACTIVO,
+            "canal_id": str(int(float(canal_id))),
+            "historial": id_cliente,
+            "ultima_actualizacion": datetime.now(timezone.utc).isoformat(),
+        },
+        on_conflict="canal,canal_id",
+    ).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +369,9 @@ class FacturaReciente:
     uuid_factura_origen: str
 
 
-def get_facturas_recientes(despacho_id: str, canal_id: str, limite: int = 3) -> list[FacturaReciente]:
+def get_facturas_recientes(
+    despacho_id: str, canal_id: str, limite: int = 3, rfc_emisor: str = "",
+) -> list[FacturaReciente]:
     """
     Últimas facturas/REPs de bitácora para este canal_id (fuente de verdad
     de qué se timbró, no el historial de chat con Claude). Se usa para que
@@ -319,16 +380,13 @@ def get_facturas_recientes(despacho_id: str, canal_id: str, limite: int = 3) -> 
     claude_client.build_system_prompt.
     """
     sb = _get_supabase()
-    canal_id_str = str(int(float(canal_id)))
-    result = (
-        sb.table("bitacora")
-        .select("*")
-        .eq("despacho_id", despacho_id)
-        .eq("canal_id", canal_id_str)
-        .order("timestamp", desc=True)
-        .limit(limite)
-        .execute()
-    )
+    query = sb.table("bitacora").select("*").eq("despacho_id", despacho_id)
+    # Modo despacho: las del emisor, sin importar desde qué chat se pidieron.
+    if rfc_emisor:
+        query = query.eq("rfc_emisor", rfc_emisor)
+    else:
+        query = query.eq("canal_id", str(int(float(canal_id))))
+    result = query.order("timestamp", desc=True).limit(limite).execute()
     return [
         FacturaReciente(
             tipo=row.get("tipo", "ingreso"),
@@ -343,19 +401,19 @@ def get_facturas_recientes(despacho_id: str, canal_id: str, limite: int = 3) -> 
     ]
 
 
-def get_bitacora_por_folio(despacho_id: str, canal_id: str, folio_fiscal: str) -> Optional[dict]:
+def get_bitacora_por_folio(
+    despacho_id: str, canal_id: str, folio_fiscal: str, rfc_emisor: str = "",
+) -> Optional[dict]:
     """Fila de bitácora de ese folio de FacturAPI SOLO si es de este canal_id
-    (un cliente no puede cancelar la factura de otro)."""
+    (un cliente no puede cancelar la factura de otro) o, en modo despacho,
+    de este emisor."""
     sb = _get_supabase()
-    result = (
-        sb.table("bitacora")
-        .select("*")
-        .eq("despacho_id", despacho_id)
-        .eq("canal_id", str(int(float(canal_id))))
-        .eq("folio_fiscal", folio_fiscal)
-        .limit(1)
-        .execute()
-    )
+    query = sb.table("bitacora").select("*").eq("despacho_id", despacho_id).eq("folio_fiscal", folio_fiscal)
+    if rfc_emisor:
+        query = query.eq("rfc_emisor", rfc_emisor)
+    else:
+        query = query.eq("canal_id", str(int(float(canal_id))))
+    result = query.limit(1).execute()
     return result.data[0] if result.data else None
 
 

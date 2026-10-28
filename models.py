@@ -19,6 +19,9 @@ class EmisorData(BaseModel):
     rfc: str
     regimen_fiscal: str
     cp_fiscal: str
+    # Solo en modo despacho (un socio factura a nombre del cliente): fila de
+    # clientes con la que se timbra al confirmar. Vacío = la del chat.
+    id_cliente: str = ""
 
 
 class ReceptorData(BaseModel):
@@ -260,6 +263,8 @@ class RepData(BaseModel):
     # Viaja en el pendiente para que al confirmar no se busque en FacturAPI,
     # que no la conoce.
     factura_origen_externa: Optional[dict] = None
+    # Modo despacho: ver EmisorData.id_cliente.
+    id_cliente_emisor: str = ""
 
     @field_validator("forma_pago")
     @classmethod
@@ -312,6 +317,9 @@ class ClientProfile(BaseModel):
     notas_fiscales: str
     activo: bool
     facturapi_key: str  # API key de la organización del cliente en FacturAPI
+    # Modo despacho: chat del socio que factura a nombre de este cliente
+    # (ver operadores.py). Vacío = el propio cliente escribe desde su chat.
+    operador_canal_id: str = ""
 
 
 class PendingPayload(BaseModel):
@@ -335,6 +343,8 @@ class PendingPayload(BaseModel):
     # Factura origen emitida fuera de FacturAPI (XML/PDF): sin ella, al
     # aprobar ANB se volvería a pedir el archivo al cliente.
     factura_origen: Optional[dict] = None
+    # Modo despacho: ver EmisorData.id_cliente.
+    id_cliente_emisor: str = ""
 
     @model_validator(mode="after")
     def validate_shape(self) -> "PendingPayload":

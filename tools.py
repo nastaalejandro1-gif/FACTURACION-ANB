@@ -22,6 +22,30 @@ FORMAS_PAGO_ENUM_REP = [f for f in FORMAS_PAGO_ENUM if f != "99"]
 CLAVE_NUEVA = "NUEVA"
 
 TOOL_BUSCAR_RECEPTOR = "buscar_receptor_guardado"
+TOOL_SELECCIONAR_EMISOR = "seleccionar_emisor"
+
+
+def build_tool_seleccionar_emisor(emisores: list[tuple[str, str]]) -> dict:
+    """
+    Modo despacho (ver operadores.py): un socio cambia el cliente A NOMBRE de
+    quien factura. emisores: (id_cliente, "Nombre (RFC)") de los que tiene
+    permiso — es el enum, así que no puede elegir uno ajeno.
+    """
+    return {
+        "name": TOOL_SELECCIONAR_EMISOR,
+        "description": (
+            "Cambia el cliente emisor a nombre de quien se factura. Llamar cuando quien escribe pide "
+            "facturar (o hacer un REP o cancelar) a nombre de un emisor distinto al actual. Ids: "
+            + "; ".join(f"{id_cliente} = {nombre}" for id_cliente, nombre in emisores)
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id_cliente": {"type": "string", "enum": [id_cliente for id_cliente, _ in emisores]},
+            },
+            "required": ["id_cliente"],
+        },
+    }
 
 
 def build_invoice_tools(claves_catalogo: list[str], folios_cancelables: list[str] = ()) -> list[dict]:

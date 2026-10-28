@@ -2,8 +2,9 @@ import base64
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Optional
+from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 import anthropic
@@ -15,14 +16,26 @@ from facturapi_client import buscar_clientes
 from models import CancelacionDraft, ClientProfile, InvoiceDraft, RepDraft
 from sat_catalogs import REGIMENES_FISCALES_VALIDOS
 from sheets_client import ClaveCatalogo, FacturaReciente, strip_binary_in_place
-from tools import TOOL_BUSCAR_RECEPTOR, build_invoice_tools
+from tools import TOOL_BUSCAR_RECEPTOR, TOOL_SELECCIONAR_EMISOR, build_invoice_tools, build_tool_seleccionar_emisor
 
 logger = logging.getLogger(__name__)
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# Una búsqueda de receptor + el draft + un reintento por validación.
-MAX_TOOL_CYCLES = 4
+# Cambio de emisor (modo despacho) + una búsqueda de receptor + el draft +
+# un reintento por validación.
+MAX_TOOL_CYCLES = 5
+
+
+@dataclass
+class ContextoOperador:
+    """
+    Modo despacho (ver operadores.py): quien escribe es un socio de ANB que
+    factura a nombre de los clientes. cambiar_emisor(id_cliente) carga y
+    guarda el nuevo emisor y devuelve (perfil, catálogo, facturas recientes).
+    """
+    emisores: list[ClientProfile]
+    cambiar_emisor: Callable[[str], tuple[ClientProfile, list[ClaveCatalogo], list[FacturaReciente]]]
 
 MENSAJE_CANCELACION = "Te mando los datos de la factura para que confirmes la cancelación. ⚠️"
 
@@ -343,6 +356,44 @@ REGLAS DE SEGURIDAD:
 """
 
 
+def build_prompt_operador(profile: ClientProfile, emisores: list[ClientProfile]) -> str:
+    lista = "\n".join(f"  id {e.id_cliente} = {e.nombre_comercial} (RFC {e.rfc})" for e in emisores)
+    return f"""
+
+MODO DESPACHO (tiene prioridad sobre lo de arriba que se refiera a "el cliente"):
+Quien te escribe NO es el cliente: es personal del despacho ANB que factura A NOMBRE del emisor
+de arriba ({profile.nombre_comercial}, RFC {profile.rfc}). Trátalo como colega; no lo saludes como
+si fuera el cliente. Todo lo demás (receptor, conceptos, confirmación, REP, cancelación) funciona
+igual, siempre con el emisor actual.
+Emisores que puede usar:
+{lista}
+- Si pide facturar (o REP o cancelar) a nombre de OTRO emisor de esta lista, llama
+  seleccionar_emisor ANTES que cualquier otra herramienta (también antes de buscar al receptor).
+- Si nombra un emisor que no está en la lista, dile que no tiene permiso para facturar a nombre
+  de ese cliente y que se lo pida a Alejandro. No uses otro emisor en su lugar.
+- En el resumen antes de confirmar, escribe primero "Emisor: {{nombre}} ({{RFC}})".
+"""
+
+
+def _system_y_tools(
+    profile: ClientProfile, catalogo: list[ClaveCatalogo], facturas_recientes: list[FacturaReciente],
+    operador: Optional[ContextoOperador],
+) -> tuple[list[dict], list[dict]]:
+    texto = build_system_prompt(profile, catalogo, facturas_recientes)
+    tools = build_invoice_tools(
+        [c.clave_prod_serv for c in catalogo],
+        [f.folio_fiscal for f in facturas_recientes if f.estado == "timbrado" and f.folio_fiscal],
+    )
+    if operador:
+        texto += build_prompt_operador(profile, operador.emisores)
+        if len(operador.emisores) > 1:
+            tools.insert(0, build_tool_seleccionar_emisor(
+                [(e.id_cliente, f"{e.nombre_comercial} ({e.rfc})") for e in operador.emisores]
+            ))
+    system = [{"type": "text", "text": texto, "cache_control": {"type": "ephemeral"}}]
+    return system, tools
+
+
 def _resultado_busqueda_receptor(profile: ClientProfile, texto: str) -> str:
     if not texto.strip():
         return "Búsqueda vacía: pregunta al cliente el nombre o RFC del receptor."
@@ -386,6 +437,7 @@ def run_conversation_turn(
     user_text: Optional[str] = None,
     file_bytes: Optional[bytes] = None,
     media_type: Optional[str] = None,
+    operador: Optional[ContextoOperador] = None,
 ) -> tuple[str, Optional[InvoiceDraft], Optional[RepDraft], Optional[CancelacionDraft]]:
     """
     Run one turn of the conversation.
@@ -412,16 +464,7 @@ def run_conversation_turn(
 
     paso_base = "extraccion_documento" if (file_bytes and media_type) else "turno_texto"
 
-    system = [{
-        "type": "text",
-        "text": build_system_prompt(profile, catalogo, facturas_recientes),
-        "cache_control": {"type": "ephemeral"},
-    }]
-
-    tools = build_invoice_tools(
-        [c.clave_prod_serv for c in catalogo],
-        [f.folio_fiscal for f in facturas_recientes if f.estado == "timbrado" and f.folio_fiscal],
-    )
+    system, tools = _system_y_tools(profile, catalogo, facturas_recientes, operador)
     # Claude a veces intenta resolver 2 pedidos del cliente en un mismo turno
     # (ej. "REP de la factura X y además una factura nueva para Y") llamando
     # 2 tools en paralelo. El código de abajo solo procesa la primera, y la
@@ -465,6 +508,26 @@ def run_conversation_turn(
                     for b in response.content
                 ],
             })
+
+            if tool_name == TOOL_SELECCIONAR_EMISOR and operador:
+                # Modo despacho: cambia el emisor y Claude sigue el mismo
+                # pedido con el prompt, catálogo y herramientas del nuevo.
+                _log_uso_claude(f"{paso_base}→{tool_name}", response)
+                id_cliente = str(tool_input.get("id_cliente", ""))
+                if id_cliente == profile.id_cliente:
+                    resultado = f"{profile.nombre_comercial} ya es el emisor actual."
+                else:
+                    profile, catalogo, facturas_recientes = operador.cambiar_emisor(id_cliente)
+                    system, tools = _system_y_tools(profile, catalogo, facturas_recientes, operador)
+                    resultado = (
+                        f"Emisor cambiado a {profile.nombre_comercial} (RFC {profile.rfc}). "
+                        "Sigue con el pedido usando este emisor."
+                    )
+                history.append({
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": tool_block.id, "content": resultado}],
+                })
+                continue
 
             if tool_name == TOOL_BUSCAR_RECEPTOR:
                 # Consulta, no pedido terminado: se responde y Claude sigue en

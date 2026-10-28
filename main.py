@@ -12,10 +12,11 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 import cfdi_xml
 import fiscal_engine
+import operadores
 import sheets_client
 import telegram_client
 import tools
-from claude_client import extraer_factura_origen_de_pdf, run_conversation_turn
+from claude_client import ContextoOperador, extraer_factura_origen_de_pdf, run_conversation_turn
 from config import ALEJANDRO_CHAT_ID, CRON_SECRET, TELEGRAM_WEBHOOK_SECRET
 from escalation import EscalationReason
 from facturapi_client import (
@@ -25,6 +26,7 @@ from facturapi_client import (
 from models import (
     MOTIVOS_CANCELACION,
     CancelacionDraft,
+    ClientProfile,
     ConceptoItem,
     EmisorData,
     FacturaData,
@@ -106,6 +108,15 @@ async def process_update(update: dict) -> None:
         if text.startswith(("/aprobar", "/rechazar", "/predeterminada")):
             await handle_approval_command(chat_id, message_id, text)
             return
+        if text.startswith(("/permiso", "/quitar", "/socios")) and int(chat_id) == ALEJANDRO_CHAT_ID:
+            await handle_admin_operadores(text)
+            return
+
+        # Modo despacho: Alejandro o un socio factura a nombre de los clientes
+        emisores = await asyncio.to_thread(operadores.emisores_permitidos, chat_id)
+        if emisores is not None:
+            await handle_operador(chat_id, message_id, message, text, emisores)
+            return
 
         # Identify client
         client_profile = await asyncio.to_thread(sheets_client.get_client_by_canal_id, "telegram", chat_id)
@@ -155,14 +166,39 @@ async def process_update(update: dict) -> None:
 LIMITE_FACTURAS_RECIENTES = 10
 
 
-async def handle_conversation(client_profile, chat_id: str, message_id: int, message: dict) -> None:
+def _facturas_recientes(client_profile, chat_id: str):
+    # Modo despacho: las del emisor, las haya pedido quien sea.
+    return sheets_client.get_facturas_recientes(
+        client_profile.despacho_id, chat_id, LIMITE_FACTURAS_RECIENTES,
+        rfc_emisor=client_profile.rfc if client_profile.operador_canal_id else "",
+    )
+
+
+async def handle_conversation(
+    client_profile, chat_id: str, message_id: int, message: dict,
+    emisores: Optional[list[ClientProfile]] = None,
+) -> None:
     history = await asyncio.to_thread(sheets_client.load_history, chat_id)
     catalogo = await asyncio.to_thread(
         sheets_client.get_catalogo_claves, client_profile.despacho_id, client_profile.id_cliente
     )
-    facturas_recientes = await asyncio.to_thread(
-        sheets_client.get_facturas_recientes, client_profile.despacho_id, chat_id, LIMITE_FACTURAS_RECIENTES
-    )
+    facturas_recientes = await asyncio.to_thread(_facturas_recientes, client_profile, chat_id)
+
+    # Modo despacho: Claude puede cambiar de emisor a media conversación
+    # (seleccionar_emisor); el perfil final es con el que se procesa el pedido.
+    perfil_actual = [client_profile]
+    operador = None
+    if emisores is not None:
+        def cambiar_emisor(id_cliente: str):
+            nuevo = operadores.como_operador(next(e for e in emisores if e.id_cliente == id_cliente), chat_id)
+            sheets_client.set_emisor_activo(chat_id, id_cliente)
+            perfil_actual[0] = nuevo
+            return (
+                nuevo,
+                sheets_client.get_catalogo_claves(nuevo.despacho_id, nuevo.id_cliente),
+                _facturas_recientes(nuevo, chat_id),
+            )
+        operador = ContextoOperador(emisores=emisores, cambiar_emisor=cambiar_emisor)
 
     # Extract text and/or file
     user_text: Optional[str] = message.get("text") or message.get("caption")
@@ -217,7 +253,9 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
             user_text=user_text,
             file_bytes=file_bytes,
             media_type=media_type,
+            operador=operador,
         )
+        client_profile = perfil_actual[0]
 
     except Exception as exc:
         error_str = str(exc)
@@ -262,6 +300,167 @@ async def handle_conversation(client_profile, chat_id: str, message_id: int, mes
 
 
 # ---------------------------------------------------------------------------
+# Modo despacho — Alejandro y los socios facturan a nombre de los clientes
+# ---------------------------------------------------------------------------
+
+MENSAJE_ELEGIR_EMISOR = (
+    "¿A nombre de qué cliente facturas? Escríbelo en tu mensaje (\"a nombre de Envoy...\") "
+    "o usa /emisor nombre.\n\n{lista}"
+)
+
+
+async def handle_operador(
+    chat_id: str, message_id: int, message: dict, text: str, emisores: list[ClientProfile],
+) -> None:
+    comando = text.strip()
+    primera = comando.split(maxsplit=1)[0].split("@")[0].lower() if comando else ""
+
+    if primera == "/start":
+        await asyncio.to_thread(sheets_client.save_history, "telegram", chat_id, [])
+        await asyncio.to_thread(sheets_client.set_emisor_activo, chat_id, "")
+        await telegram_client.send_message(
+            chat_id, "¡Listo! Empezamos de cero. 😊\n\n" + MENSAJE_ELEGIR_EMISOR.format(
+                lista=operadores.lista_emisores(emisores)
+            ),
+        )
+        return
+
+    if primera == "/emisor":
+        await _comando_emisor(chat_id, comando.partition(" ")[2], emisores)
+        return
+
+    async with sheets_client.get_channel_lock(chat_id):
+        perfil = await asyncio.to_thread(operadores.perfil_activo, chat_id, emisores)
+        if perfil is None:
+            candidatos = operadores.mencionados(text or message.get("caption") or "", emisores)
+            if len(candidatos) != 1:
+                await telegram_client.send_message(
+                    chat_id, MENSAJE_ELEGIR_EMISOR.format(lista=operadores.lista_emisores(emisores))
+                )
+                return
+            await asyncio.to_thread(sheets_client.set_emisor_activo, chat_id, candidatos[0].id_cliente)
+            perfil = operadores.como_operador(candidatos[0], chat_id)
+        await handle_conversation(perfil, chat_id, message_id, message, emisores=emisores)
+
+
+async def _comando_emisor(chat_id: str, buscado: str, emisores: list[ClientProfile]) -> None:
+    if not buscado.strip():
+        activo = await asyncio.to_thread(operadores.perfil_activo, chat_id, emisores)
+        actual = f"Emisor actual: <b>{html.escape(activo.nombre_comercial)}</b>\n\n" if activo else ""
+        await telegram_client.send_message(
+            chat_id, f"{actual}Puedes facturar a nombre de:\n{operadores.lista_emisores(emisores, activo)}\n\n"
+            "Para cambiar: /emisor nombre"
+        )
+        return
+    encontrados = operadores.buscar_emisor(buscado, emisores)
+    if len(encontrados) != 1:
+        motivo = (
+            "Hay varios que coinciden" if encontrados
+            else f"No tienes permiso para \"{html.escape(buscado)}\" o no existe"
+        )
+        await telegram_client.send_message(
+            chat_id, f"{motivo}. Puedes facturar a nombre de:\n"
+            f"{operadores.lista_emisores(encontrados or emisores)}"
+        )
+        return
+    emisor = encontrados[0]
+    async with sheets_client.get_channel_lock(chat_id):
+        await asyncio.to_thread(sheets_client.set_emisor_activo, chat_id, emisor.id_cliente)
+        # Conversación nueva: el contexto del emisor anterior no aplica.
+        await asyncio.to_thread(sheets_client.save_history, "telegram", chat_id, [])
+    await telegram_client.send_message(
+        chat_id,
+        f"Listo, ahora facturas a nombre de <b>{html.escape(emisor.nombre_comercial)}</b> "
+        f"({html.escape(emisor.rfc)}). Mándame el pedido. 📄"
+    )
+
+
+async def handle_admin_operadores(text: str) -> None:
+    """/socios, /permiso {chat_id} {cliente|todos}, /quitar {chat_id} {cliente|todos} — solo Alejandro."""
+    partes = text.strip().split(maxsplit=2)
+    comando = partes[0].split("@")[0].lower()
+    clientes = await asyncio.to_thread(sheets_client.get_clientes_activos)
+    canonicos = operadores.canonicos([c for c, _ in clientes])
+
+    if comando == "/socios":
+        lineas = []
+        for c in canonicos:
+            socios = sorted({o for fila, ops in clientes if fila.rfc.upper() == c.rfc.upper() for o in ops})
+            lineas.append(
+                f"• {html.escape(c.nombre_comercial)} ({html.escape(c.rfc)}): "
+                f"{', '.join(socios) if socios else 'solo tú'}"
+            )
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            "Quién puede facturar a nombre de cada cliente (además de ti):\n" + "\n".join(lineas)
+            + "\n\n/permiso {chat_id} {cliente|todos} · /quitar {chat_id} {cliente|todos}",
+        )
+        return
+
+    if len(partes) < 3 or not partes[1].lstrip("-").isdigit():
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            f"Formato: {comando} {{chat_id}} {{cliente|todos}}\n"
+            "El chat_id del socio te llega cuando le escribe al bot por primera vez.",
+        )
+        return
+    socio, buscado = partes[1], partes[2]
+    todos = buscado.strip().lower() == "todos"
+    elegidos = canonicos if todos else operadores.buscar_emisor(buscado, canonicos)
+    if not elegidos:
+        await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"No encontré el cliente \"{html.escape(buscado)}\".")
+        return
+    if len(elegidos) > 1 and not todos:
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID, f"Coinciden varios, sé más específico:\n{operadores.lista_emisores(elegidos)}"
+        )
+        return
+
+    rfcs = {e.rfc.upper() for e in elegidos}
+    ids_canonicos = {e.id_cliente for e in elegidos}
+    try:
+        for fila, ops in clientes:
+            if fila.rfc.upper() not in rfcs:
+                continue
+            if comando == "/permiso":
+                # El permiso vive en la fila canónica del RFC (ver operadores.py).
+                if fila.id_cliente in ids_canonicos and socio not in ops:
+                    await asyncio.to_thread(sheets_client.set_operadores, fila.id_cliente, [*ops, socio])
+            elif socio in ops:
+                await asyncio.to_thread(
+                    sheets_client.set_operadores, fila.id_cliente, [o for o in ops if o != socio]
+                )
+    except Exception as exc:
+        logger.exception("No se pudieron guardar los permisos de %s", socio)
+        await telegram_client.send_message(
+            ALEJANDRO_CHAT_ID,
+            "No se pudo guardar el permiso. ¿Ya existe la columna en Supabase?\n"
+            "<code>ALTER TABLE clientes ADD COLUMN operadores text[] NOT NULL DEFAULT '{}';</code>\n"
+            f"{html.escape(type(exc).__name__)}: {html.escape(str(exc)[:300])}",
+        )
+        return
+
+    nombres = ", ".join(html.escape(e.nombre_comercial) for e in elegidos)
+    if comando == "/permiso":
+        msg = f"✅ {socio} ya puede facturar a nombre de: {nombres}."
+    else:
+        msg = f"✅ {socio} ya no puede facturar a nombre de: {nombres}."
+    await telegram_client.send_message(ALEJANDRO_CHAT_ID, msg)
+
+
+async def _perfil_de_pendiente(pending: dict, id_cliente_emisor: str = "") -> Optional[ClientProfile]:
+    """Perfil con el que se timbra un pendiente. En modo despacho el chat no
+    basta (un socio factura como varios clientes): viene el id del emisor y
+    se vuelve a verificar que el socio siga teniendo permiso."""
+    canal_id = str(pending["canal_id"])
+    if id_cliente_emisor:
+        return await asyncio.to_thread(operadores.perfil_operador, canal_id, id_cliente_emisor)
+    return await asyncio.to_thread(
+        sheets_client.get_client_by_canal_id, str(pending.get("canal", "telegram")), canal_id
+    )
+
+
+# ---------------------------------------------------------------------------
 # Factura de ingreso — cálculo, escalamiento, confirmación del cliente
 # ---------------------------------------------------------------------------
 
@@ -272,6 +471,7 @@ def _build_invoice_data(draft: InvoiceDraft, client_profile, calculada: fiscal_e
         rfc=client_profile.rfc,
         regimen_fiscal=client_profile.regimen_fiscal,
         cp_fiscal=client_profile.cp_fiscal,
+        id_cliente=client_profile.id_cliente if client_profile.operador_canal_id else "",
     )
     conceptos = [
         ConceptoItem(
@@ -324,6 +524,12 @@ async def _calcular_y_procesar_factura(
     Devuelve el InvoiceData si se envió al cliente para confirmación, o None
     si se escaló a ANB o hubo un error (ambos ya avisan por su cuenta).
     """
+    operador = bool(client_profile.operador_canal_id)
+    if operador:
+        # Modo despacho: la confirmación del socio basta (no hay revisión de
+        # ANB). Una clave nueva se aprueba al vuelo y queda en el catálogo.
+        draft = await _aprobar_claves_nuevas(draft, client_profile, f"OPERADOR {client_profile.operador_canal_id}")
+
     if not omitir_validacion_cruzada:
         claves_nuevas = [c for c in draft.factura.conceptos if c.clave_prod_serv == tools.CLAVE_NUEVA]
         if claves_nuevas:
@@ -374,6 +580,17 @@ async def _calcular_y_procesar_factura(
         omitir_validacion_cruzada=omitir_validacion_cruzada,
     )
 
+    advertencia = ""
+    if resultado.escalation and operador:
+        # Sin revisión de ANB: la inconsistencia se le muestra al socio en el
+        # resumen y él decide si confirma.
+        advertencia = resultado.escalation.detail
+        resultado = fiscal_engine.calcular_factura(
+            conceptos_extraidos, draft.receptor, reglas,
+            draft.factura.metodo_pago, draft.factura.forma_pago,
+            omitir_validacion_cruzada=True,
+        )
+
     if resultado.escalation:
         envelope = PendingPayload(
             tipo="ingreso",
@@ -393,8 +610,30 @@ async def _calcular_y_procesar_factura(
         return None
 
     invoice_data = _build_invoice_data(draft, client_profile, resultado.factura)
-    await _solicitar_confirmacion_cliente(invoice_id, invoice_data, client_profile, chat_id, message_id)
+    await _solicitar_confirmacion_cliente(
+        invoice_id, invoice_data, client_profile, chat_id, message_id, advertencia=advertencia
+    )
     return invoice_data
+
+
+async def _aprobar_claves_nuevas(draft: InvoiceDraft, client_profile, aprobada_por: str) -> InvoiceDraft:
+    """Cambia cada clave NUEVA por su propuesta y la guarda en el catálogo del cliente."""
+    if not any(c.clave_prod_serv == tools.CLAVE_NUEVA for c in draft.factura.conceptos):
+        return draft
+    draft = draft.model_copy(deep=True)
+    for c in draft.factura.conceptos:
+        if c.clave_prod_serv == tools.CLAVE_NUEVA and c.clave_prod_serv_propuesta:
+            await asyncio.to_thread(
+                sheets_client.save_clave_aprobada,
+                despacho_id=client_profile.despacho_id,
+                id_cliente=client_profile.id_cliente,
+                clave_prod_serv=c.clave_prod_serv_propuesta,
+                descripcion_clave=c.descripcion,
+                aplica_ieps=False,  # ANB puede corregir esto en Supabase si el concepto sí lleva IEPS
+                aprobada_por=aprobada_por,
+            )
+            c.clave_prod_serv = c.clave_prod_serv_propuesta
+    return draft
 
 
 MAX_CONCEPTOS_EN_REVISION = 25  # Telegram corta mensajes de más de 4096 caracteres
@@ -506,6 +745,8 @@ async def _escalar_a_anb(
     invoice_id: str, chat_id: str, message_id: int, client_profile, envelope: PendingPayload,
     vista_previa: Optional[fiscal_engine.FacturaCalculada] = None,
 ) -> None:
+    if client_profile.operador_canal_id:
+        envelope = envelope.model_copy(update={"id_cliente_emisor": client_profile.id_cliente})
     await asyncio.to_thread(
         sheets_client.save_pending,
         invoice_id=invoice_id,
@@ -548,8 +789,17 @@ async def _escalar_a_anb(
     )
 
 
+def _linea_emisor_operador(client_profile) -> list[str]:
+    """Modo despacho: el resumen dice en grande a nombre de quién se timbra."""
+    if not client_profile.operador_canal_id:
+        return []
+    e = html.escape
+    return [f"🏢 <b>Emisor: {e(client_profile.nombre_comercial)} ({e(client_profile.rfc)})</b>"]
+
+
 async def _solicitar_confirmacion_cliente(
-    invoice_id: str, invoice_data: InvoiceData, client_profile, chat_id: str, message_id: int
+    invoice_id: str, invoice_data: InvoiceData, client_profile, chat_id: str, message_id: int,
+    advertencia: str = "",
 ) -> None:
     await asyncio.to_thread(
         sheets_client.save_pending,
@@ -566,9 +816,13 @@ async def _solicitar_confirmacion_cliente(
     conceptos_texto = "\n".join(
         f"  • {c.descripcion} — {c.cantidad} x ${c.precio_unitario:,.2f}" for c in f.conceptos
     )
+    receptor = invoice_data.receptor
     lineas = [
         "📄 Resumen de tu factura:",
         "",
+        *_linea_emisor_operador(client_profile),
+        *([f"Receptor: {html.escape(receptor.razon_social)} ({html.escape(receptor.rfc)})", ""]
+          if client_profile.operador_canal_id else []),
         conceptos_texto,
         "",
         f"Subtotal: ${f.monto_antes_impuestos:,.2f}",
@@ -581,6 +835,8 @@ async def _solicitar_confirmacion_cliente(
     if f.retencion_isr > 0:
         lineas.append(f"Retención ISR: -${f.retencion_isr:,.2f}")
     lineas.append(f"Total: ${f.total_estimado:,.2f}")
+    if advertencia:
+        lineas += ["", f"⚠️ Revisa antes de confirmar: {html.escape(advertencia)}"]
     lineas.append("")
     lineas.append("¿Confirmas estos datos para timbrar tu factura?")
 
@@ -703,13 +959,15 @@ async def _timbre_and_deliver(
     await telegram_client.send_document(
         chat_id, xml_bytes, f"{nombre}.xml"
     )
-    await send_invoice_email(
-        to_email=client_profile.email_factura,
-        nombre_comercial=client_profile.nombre_comercial,
-        folio=nombre,
-        pdf_bytes=pdf_bytes,
-        xml_bytes=xml_bytes,
-    )
+    # Modo despacho: los archivos le llegan solo a quien la pidió (decisión de Alejandro).
+    if not client_profile.operador_canal_id:
+        await send_invoice_email(
+            to_email=client_profile.email_factura,
+            nombre_comercial=client_profile.nombre_comercial,
+            folio=nombre,
+            pdf_bytes=pdf_bytes,
+            xml_bytes=xml_bytes,
+        )
     await asyncio.to_thread(
         sheets_client.log_to_bitacora,
         invoice_id=invoice_id, canal_id=chat_id,
@@ -1030,6 +1288,7 @@ async def _calcular_y_timbrar_rep(
         imp_saldo_insoluto=resultado.rep.imp_saldo_insoluto,
         liquidacion=draft.liquidar_saldo,
         factura_origen_externa=original_invoice if externa else None,
+        id_cliente_emisor=client_profile.id_cliente if client_profile.operador_canal_id else "",
     )
     # Factura de otro programa sin pagos nuestros ni saldo fijado por ANB:
     # se asumió primer pago (saldo = total). El cliente puede corregirlo.
@@ -1060,6 +1319,7 @@ async def _solicitar_confirmacion_cliente_rep(
     lineas = [
         "💳 Resumen de tu complemento de pago (REP):",
         "",
+        *_linea_emisor_operador(client_profile),
         f"Factura original: {rep_data.uuid_factura_origen}",
         f"Cliente: {html.escape(rep_data.receptor.razon_social)} ({rep_data.receptor.rfc})",
         f"Monto pagado: ${rep_data.monto_pagado:,.2f}",
@@ -1257,8 +1517,7 @@ async def _execute_approval(
         return f"{'REP' if es_rep else 'Factura'} rechazado."
 
     # aprobar
-    canal = str(pending.get("canal", "telegram"))
-    client_profile = await asyncio.to_thread(sheets_client.get_client_by_canal_id, canal, client_canal_id)
+    client_profile = await _perfil_de_pendiente(pending, envelope.id_cliente_emisor)
     if not client_profile:
         msg = (
             f"⚠️ No encontré el perfil del cliente (canal_id: {client_canal_id}). "
@@ -1318,19 +1577,7 @@ async def _execute_approval(
                 c.clave_prod_serv_propuesta = ""
         omitir_validacion = False
     elif envelope.escalation_reason == EscalationReason.CLAVE_PROD_SERV_NUEVA.value:
-        draft = draft.model_copy(deep=True)
-        for c in draft.factura.conceptos:
-            if c.clave_prod_serv == tools.CLAVE_NUEVA and c.clave_prod_serv_propuesta:
-                await asyncio.to_thread(
-                    sheets_client.save_clave_aprobada,
-                    despacho_id=client_profile.despacho_id,
-                    id_cliente=client_profile.id_cliente,
-                    clave_prod_serv=c.clave_prod_serv_propuesta,
-                    descripcion_clave=c.descripcion,
-                    aplica_ieps=False,  # ANB puede corregir esto en Supabase si el concepto sí lleva IEPS
-                    aprobada_por="ALEJANDRO",
-                )
-                c.clave_prod_serv = c.clave_prod_serv_propuesta
+        draft = await _aprobar_claves_nuevas(draft, client_profile, "ALEJANDRO")
         omitir_validacion = False  # ya no hay "NUEVA" en el draft, no hace falta omitir nada
 
     await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⏳ Recalculando {invoice_id}...")
@@ -1415,10 +1662,14 @@ async def _execute_client_confirmation(command: str, invoice_id: str, pending: d
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⚠️ Error al leer datos de {invoice_id}: {exc}")
         return
 
-    canal = str(pending.get("canal", "telegram"))
-    client_profile = await asyncio.to_thread(sheets_client.get_client_by_canal_id, canal, chat_id)
+    id_emisor = rep_data.id_cliente_emisor if es_rep else invoice_data.emisor.id_cliente
+    client_profile = await _perfil_de_pendiente(pending, id_emisor)
     if not client_profile:
         await telegram_client.send_message(ALEJANDRO_CHAT_ID, f"⚠️ No encontré el perfil del cliente para {invoice_id}.")
+        if id_emisor:
+            await telegram_client.send_message(
+                chat_id, "Ya no tienes permiso para facturar a nombre de ese cliente. No se timbró."
+            )
         return
 
     message_id = int(pending.get("telegram_message_id") or 0)
@@ -1545,9 +1796,11 @@ async def handle_callback_query(callback_query: dict) -> None:
             )
             await telegram_client.answer_callback_query(callback_id, "No autorizado")
             return
-        client_profile = await asyncio.to_thread(
-            sheets_client.get_client_by_canal_id, str(pending.get("canal", "telegram")), chat_id
-        )
+        try:
+            id_emisor = str(json.loads(pending["invoice_json"]).get("id_cliente_emisor", ""))
+        except (TypeError, ValueError):
+            id_emisor = ""
+        client_profile = await _perfil_de_pendiente(pending, id_emisor)
         if not client_profile:
             await telegram_client.answer_callback_query(callback_id, "No autorizado")
             return
@@ -1568,7 +1821,8 @@ async def _solicitar_confirmacion_cancelacion(
     # Claude solo puede elegir folios de las facturas recientes de este
     # chat (enum de la tool), pero se re-verifica aquí contra bitácora.
     fila = await asyncio.to_thread(
-        sheets_client.get_bitacora_por_folio, client_profile.despacho_id, chat_id, cancelacion.folio
+        sheets_client.get_bitacora_por_folio, client_profile.despacho_id, chat_id, cancelacion.folio,
+        rfc_emisor=client_profile.rfc if client_profile.operador_canal_id else "",
     )
     if not fila or fila.get("estado") != "timbrado":
         await telegram_client.send_message(
@@ -1610,6 +1864,7 @@ async def _solicitar_confirmacion_cancelacion(
             "motivo": cancelacion.motivo,
             "bitacora_id": fila["id"],
             "tipo": "rep" if es_rep else "ingreso",
+            "id_cliente_emisor": client_profile.id_cliente if client_profile.operador_canal_id else "",
         }),
         motivo_revision=f"Cancelación motivo {cancelacion.motivo}",
         tipo_aprobacion="cliente_cancelacion",
@@ -1622,6 +1877,7 @@ async def _solicitar_confirmacion_cancelacion(
     lineas = [
         f"⚠️ Vas a <b>CANCELAR</b> ante el SAT {'este complemento de pago' if es_rep else 'esta factura'}:",
         "",
+        *_linea_emisor_operador(client_profile),
         f"Folio: {e(_nombre_archivo_cfdi(factura, 'cfdi', cancelacion.folio))}",
         f"Receptor: {e(str(cliente.get('legal_name', '')))} ({e(str(cliente.get('tax_id', fila.get('rfc_receptor', ''))))})",
         f"Total: ${total:,.2f}",
@@ -1742,9 +1998,11 @@ async def check_pending(x_cron_secret: Optional[str] = Header(None)):
         razon = motivo[1:].partition("]")[0] if motivo.startswith("[") else ""
         clave_default = ""
         if razon == EscalationReason.CLAVE_PROD_SERV_NUEVA.value:
-            perfil = await asyncio.to_thread(
-                sheets_client.get_client_by_canal_id, str(row.get("canal", "telegram")), str(canal_id)
-            )
+            try:
+                id_emisor = str(json.loads(row.get("invoice_json") or "{}").get("id_cliente_emisor", ""))
+            except (TypeError, ValueError):
+                id_emisor = ""
+            perfil = await _perfil_de_pendiente(row, id_emisor)
             clave_default = perfil.clave_prod_serv_default if perfil else ""
         comandos, teclado = _botones_revision_anb(invoice_id, razon, clave_default)
         await telegram_client.send_message(

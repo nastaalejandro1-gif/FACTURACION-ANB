@@ -34,7 +34,7 @@ def _patch(monkeypatch, fila=FILA_BITACORA, factura=FACTURA_FAPI):
         return factura
 
     monkeypatch.setattr(main.telegram_client, "send_message", fake_send)
-    monkeypatch.setattr(main.sheets_client, "get_bitacora_por_folio", lambda despacho, canal, folio: fila)
+    monkeypatch.setattr(main.sheets_client, "get_bitacora_por_folio", lambda despacho, canal, folio, rfc_emisor="": fila)
     monkeypatch.setattr(main.sheets_client, "save_pending", lambda **kw: saved.append(kw))
     monkeypatch.setattr(main.sheets_client, "update_pending_status", lambda pid, e: estados_pend.append(e))
     monkeypatch.setattr(main.sheets_client, "update_bitacora_estado", lambda bid, e, *a: estados_bit.append((bid, e)))
