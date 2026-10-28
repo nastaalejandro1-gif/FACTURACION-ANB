@@ -60,10 +60,19 @@ def test_socio_solo_ve_los_clientes_que_alejandro_le_dio():
     assert [e.id_cliente for e in emisores] == ["1"]
 
 
-def test_socio_con_fila_propia_la_conserva_como_emisor():
-    socio = ANB_5.canal_id
-    emisores = operadores.calcular_emisores(socio, False, _clientes(operadores_sin_culpa=[socio]))
-    assert {e.id_cliente for e in emisores} == {"5", "2"}
+def test_socio_de_anb_ve_todos_los_clientes_sin_permiso_y_conserva_su_fila():
+    emisores = operadores.calcular_emisores(ANB_5.canal_id, False, _clientes())
+    assert [e.id_cliente for e in emisores] == ["5", "1", "2"]  # ANB (la suya), Envoy, Sin Culpa
+
+
+def test_cliente_normal_no_es_socio_aunque_tenga_varias_filas():
+    assert operadores.calcular_emisores(ENVOY_3.canal_id, False, _clientes()) is None
+
+
+def test_externo_con_fila_propia_la_conserva_como_emisor():
+    externo = ENVOY_3.canal_id
+    emisores = operadores.calcular_emisores(externo, False, _clientes(operadores_sin_culpa=[externo]))
+    assert {e.id_cliente for e in emisores} == {"3", "2"}
 
 
 def test_buscar_emisor_sin_acentos_ni_mayusculas_y_por_rfc():

@@ -2,8 +2,9 @@
 Modo despacho: Alejandro y los socios que él autorice facturan desde su
 propio chat A NOMBRE de los clientes del despacho.
 
-- Alejandro (ALEJANDRO_CHAT_ID) puede usar a todos los clientes activos.
-- Un socio puede usar los clientes cuya columna `clientes.operadores`
+- Alejandro (ALEJANDRO_CHAT_ID) y los socios de ANB (chats en filas con el
+  mismo RFC que la de Alejandro, ver es_socio) usan a todos los clientes.
+- Alguien externo puede usar los clientes cuya columna `clientes.operadores`
   incluye su chat_id (Alejandro la administra con /permiso y /quitar).
 - Un cliente puede tener varias filas con el mismo RFC (un chat por persona
   de su equipo); como emisor cuenta una sola: la del propio chat si la hay,
@@ -41,6 +42,14 @@ def canonicos(clientes: list[ClientProfile]) -> list[ClientProfile]:
     return sorted(por_rfc.values(), key=lambda c: normalizar(c.nombre_comercial))
 
 
+def es_socio(chat_id: str, clientes: list[tuple[ClientProfile, list[str]]]) -> bool:
+    """Socio de ANB = su chat está en una fila con el mismo RFC que la de
+    Alejandro (las filas del propio despacho). Ve a todos los clientes sin
+    necesitar /permiso."""
+    rfc_despacho = {c.rfc.upper() for c, _ in clientes if c.canal_id == str(ALEJANDRO_CHAT_ID)}
+    return any(c.canal_id == chat_id and c.rfc.upper() in rfc_despacho for c, _ in clientes)
+
+
 def calcular_emisores(
     chat_id: str, es_admin: bool, clientes: list[tuple[ClientProfile, list[str]]],
 ) -> Optional[list[ClientProfile]]:
@@ -48,7 +57,7 @@ def calcular_emisores(
     Emisores que puede usar ese chat, o None si no está en modo despacho
     (cliente normal). Lógica pura — ver emisores_permitidos para la consulta.
     """
-    if es_admin:
+    if es_admin or es_socio(chat_id, clientes):
         visibles = [c for c, _ in clientes]
     else:
         con_permiso = {c.rfc.upper() for c, operadores in clientes if chat_id in operadores}
