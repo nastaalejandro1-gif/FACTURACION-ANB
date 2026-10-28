@@ -98,11 +98,9 @@ def _calcular_tasas_retencion_efectivas(data: InvoiceData) -> tuple[Decimal, Dec
     para las retenciones de esa línea, no solo para el IVA).
 
     Pero `factura.retencion_iva`/`retencion_isr` (ver fiscal_engine.py) se
-    calculan contra bases DISTINTAS: retencion_iva = iva_total * tasa
-    (fórmula validada por el despacho — ver el fixture histórico de
-    test_critical.py, retencion_iva=85.36 para iva=800.00 = 800*0.1067),
-    y retencion_isr = subtotal SIN ieps * tasa. Ninguna de las dos
-    coincide con la base que usa FacturAPI.
+    pueden calcularse contra una base distinta: retencion_iva usa la misma
+    base que FacturAPI (importe + ieps, tasa 0.106667), pero retencion_isr
+    = subtotal SIN ieps * tasa, que no coincide cuando hay IEPS.
 
     Por eso NO se manda la tasa "semántica" (data.factura.retencion_*_tasa)
     directo a FacturAPI — se back-calcula la tasa EFECTIVA que, aplicada a

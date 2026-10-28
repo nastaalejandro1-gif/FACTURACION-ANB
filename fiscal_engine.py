@@ -170,8 +170,15 @@ def calcular_factura(
     # iva=308.63, FacturAPI (por línea) daba 308.62.
     tasa_iva = reglas.tasa_iva if reglas.iva_aplica else Decimal("0")
 
+    # Retención de IVA: misma base que el IVA trasladado (importe + IEPS) por
+    # la tasa sobre la base (0.106667 = 2/3 del IVA), redondeada por línea
+    # como FacturAPI. Antes se calculaba iva * tasa — retenía ~1.7% del
+    # subtotal en vez de 10.6667%.
+    tasa_ret_iva = reglas.retencion_iva_tasa if (tipo_persona == "PM" and tasa_iva > 0) else Decimal("0")
+
     conceptos_calculados: list[ConceptoCalculado] = []
     iva_total = Decimal("0.00")
+    retencion_iva_total = Decimal("0.00")
     for c in conceptos:
         importe = _redondear(c.cantidad * c.precio_unitario)
         aplica_ieps = c.clave_prod_serv in reglas.claves_con_ieps
@@ -179,6 +186,7 @@ def calcular_factura(
         ieps_concepto = _redondear(importe * ieps_tasa_concepto) if aplica_ieps else Decimal("0.00")
         iva_concepto = _redondear((importe + ieps_concepto) * tasa_iva)
         iva_total += iva_concepto
+        retencion_iva_total += _redondear((importe + ieps_concepto) * tasa_ret_iva)
         conceptos_calculados.append(ConceptoCalculado(
             descripcion=c.descripcion,
             clave_prod_serv=c.clave_prod_serv,
@@ -195,9 +203,9 @@ def calcular_factura(
     iva = iva_total
 
     if tipo_persona == "PM":
-        retencion_iva_tasa = reglas.retencion_iva_tasa
+        retencion_iva_tasa = tasa_ret_iva
         retencion_isr_tasa = reglas.retencion_isr_tasa
-        retencion_iva = _redondear(iva * retencion_iva_tasa)
+        retencion_iva = retencion_iva_total
         retencion_isr = _redondear(subtotal * retencion_isr_tasa)
     else:
         # Receptor PF: retenciones siempre en 0, sin excepción.

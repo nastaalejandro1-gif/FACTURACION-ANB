@@ -104,10 +104,8 @@ def test_ieps_solo_se_incluye_si_concepto_tiene_ieps():
 
 def test_retenciones_se_back_calculan_para_que_facturapi_reconstruya_el_monto_exacto():
     """
-    fiscal_engine calcula retencion_iva = iva_amount * tasa (validado contra
-    el fixture histórico del despacho: 800*0.1067=85.36) y retencion_isr =
-    subtotal_sin_ieps * tasa — bases DISTINTAS a la que usa FacturAPI
-    (precio_concepto + ieps_concepto). Si se manda la tasa "semántica" tal
+    fiscal_engine calcula retencion_isr = subtotal_sin_ieps * tasa — base
+    DISTINTA a la que usa FacturAPI (precio_concepto + ieps_concepto). Si se manda la tasa "semántica" tal
     cual, FacturAPI calcula un monto totalmente distinto. Este test simula
     exactamente eso: rate * base_facturapi sumado en todos los conceptos
     debe reconstruir el monto que calculó fiscal_engine, no otra cosa.
@@ -125,7 +123,7 @@ def test_retenciones_se_back_calculan_para_que_facturapi_reconstruya_el_monto_ex
     ]
     invoice_data = _invoice(
         conceptos, iva=Decimal("187.52"), tasa_iva=Decimal("0.16"),
-        retencion_iva=Decimal("20.01"), retencion_iva_tasa=Decimal("0.1067"),
+        retencion_iva=Decimal("125.01"), retencion_iva_tasa=Decimal("0.106667"),
         retencion_isr=Decimal("13.75"), retencion_isr_tasa=Decimal("0.0125"),
     )
     retenciones = _calcular_tasas_retencion_efectivas(invoice_data)

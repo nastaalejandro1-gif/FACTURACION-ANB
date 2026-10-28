@@ -103,7 +103,7 @@ def test_retenciones_solo_si_receptor_es_pm():
     reglas = FiscalRules(
         iva_aplica=True,
         tasa_iva=Decimal("0.16"),
-        retencion_iva_tasa=Decimal("0.10"),
+        retencion_iva_tasa=Decimal("0.106667"),
         retencion_isr_tasa=Decimal("0.10"),
         ieps_tasa=Decimal("0"),
         claves_con_ieps=frozenset(),
@@ -116,9 +116,10 @@ def test_retenciones_solo_si_receptor_es_pm():
 
     resultado_pm = calcular_factura(conceptos, RECEPTOR_PM, reglas, "PUE", "03")
     f_pm = resultado_pm.factura
-    assert f_pm.retencion_iva == Decimal("80.00")
+    # Retención IVA = base (5000) * 0.106667 = 2/3 del IVA, no iva * tasa.
+    assert f_pm.retencion_iva == Decimal("533.34")
     assert f_pm.retencion_isr == Decimal("500.00")
-    assert f_pm.total == Decimal("5220.00")
+    assert f_pm.total == Decimal("4766.66")
 
     resultado_pf = calcular_factura(conceptos, RECEPTOR_PF, reglas, "PUE", "03")
     f_pf = resultado_pf.factura
@@ -285,7 +286,7 @@ def test_iva_se_calcula_por_concepto_no_sobre_el_agregado():
     """
     reglas = FiscalRules(
         iva_aplica=True, tasa_iva=Decimal("0.16"),
-        retencion_iva_tasa=Decimal("0.1067"), retencion_isr_tasa=Decimal("0.0125"),
+        retencion_iva_tasa=Decimal("0.106667"), retencion_isr_tasa=Decimal("0.0125"),
         ieps_tasa=Decimal("0.08"), claves_con_ieps=frozenset({"50192100"}),
     )
     conceptos = [
@@ -304,9 +305,10 @@ def test_iva_se_calcula_por_concepto_no_sobre_el_agregado():
     # 308.62 (por concepto), NO 308.63 (agregado) -- esto es lo que verificó
     # el timbrado real contra FacturAPI.
     assert f.iva == Decimal("308.62")
-    assert f.retencion_iva == Decimal("32.93")
+    # Retención IVA por línea sobre (importe + ieps): 64.37 + 104.05 + 37.33
+    assert f.retencion_iva == Decimal("205.75")
     assert f.retencion_isr == Decimal("22.65")
-    assert f.total == Decimal("2181.95")
+    assert f.total == Decimal("2009.13")
 
 
 def test_iva_por_concepto_reconstruye_suma_de_lineas_individuales():
