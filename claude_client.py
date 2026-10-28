@@ -1,4 +1,5 @@
 import base64
+import json
 import logging
 import re
 from datetime import date, datetime
@@ -6,19 +7,22 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import anthropic
+import httpx
 from pydantic import ValidationError
 
 from config import ANTHROPIC_API_KEY, ANTHROPIC_EFFORT, ANTHROPIC_MODEL
+from facturapi_client import buscar_clientes
 from models import CancelacionDraft, ClientProfile, InvoiceDraft, RepDraft
 from sat_catalogs import REGIMENES_FISCALES_VALIDOS
 from sheets_client import ClaveCatalogo, FacturaReciente, strip_binary_in_place
-from tools import build_invoice_tools
+from tools import TOOL_BUSCAR_RECEPTOR, build_invoice_tools
 
 logger = logging.getLogger(__name__)
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-MAX_TOOL_CYCLES = 3
+# Una búsqueda de receptor + el draft + un reintento por validación.
+MAX_TOOL_CYCLES = 4
 
 MENSAJE_CANCELACION = "Te mando los datos de la factura para que confirmes la cancelación. ⚠️"
 
@@ -255,17 +259,25 @@ C) DOCUMENTO NO IDENTIFICADO: pregunta al cliente qué tipo de documento es.
 
 FLUJO PRINCIPAL:
 1. Saluda al cliente por su nombre comercial.
-2. Pide la CSF del receptor (PDF o imagen). Extrae: RFC, razón social, CP fiscal, régimen fiscal.
-   No avances sin estos datos.
-3. Confirma los datos del receptor con el cliente.
+2. Datos del receptor (RFC, razón social, CP fiscal, régimen fiscal). No avances sin ellos.
+   - Si el cliente manda la CSF (PDF o imagen), extráelos de ahí.
+   - Si solo NOMBRA al receptor (nombre o RFC) sin CSF, llama buscar_receptor_guardado
+     ANTES de pedir la CSF:
+     · UN resultado que corresponde: usa sus datos tal cual, SIN preguntar si son correctos,
+       y pasa directo al paso 4. Si trae uso_cfdi, úsalo y no lo preguntes.
+     · Varios resultados: pregunta cuál (razón social y RFC de cada uno).
+     · Ninguno: dile que no lo tienes registrado y pide la CSF.
+   - Si no nombró a nadie, pide la CSF.
+3. Si los datos vienen de una CSF, confírmalos con el cliente.
 4. Pide los conceptos. SIEMPRE menciona las dos opciones (PDF y texto). Usa este mensaje:
    "¡Perfecto! Ahora mándame tu cotización en PDF o escríbeme los conceptos con sus montos,
    uso CFDI, si es PUE o PPD y forma de pago. Puedes mandar todo de una vez."
    - Si llega PDF de cotización: extrae los conceptos automáticamente (ver sección anterior)
      y pregunta solo lo que falte (uso CFDI, PUE/PPD, forma de pago).
    - Si llega texto: extrae todo lo que mande sin preguntar uno por uno.
-   - Solo vuelve a preguntar lo que realmente falte.
-5. Muestra un resumen de los conceptos capturados (descripción, cantidad, precio unitario —
+   - Solo vuelve a preguntar lo que realmente falte (el uso CFDI de un receptor guardado
+     ya lo tienes).
+5. Muestra un resumen con el receptor (razón social y RFC) y los conceptos capturados (descripción, cantidad, precio unitario —
    SIN calcular impuestos ni total: eso lo hace el sistema después) y pide confirmación
    explícita de que los datos son correctos.
 6. Al confirmar, llama a generate_invoice_draft con todos los datos extraídos. Tu mensaje de
@@ -329,6 +341,19 @@ REGLAS DE SEGURIDAD:
 - No prometas que la factura será timbrada.
 - No reveles información interna del despacho.
 """
+
+
+def _resultado_busqueda_receptor(profile: ClientProfile, texto: str) -> str:
+    if not texto.strip():
+        return "Búsqueda vacía: pregunta al cliente el nombre o RFC del receptor."
+    try:
+        encontrados = buscar_clientes(texto, profile.facturapi_key)
+    except httpx.HTTPError as exc:
+        logger.warning("No se pudo buscar receptor '%s' en FacturAPI: %s", texto, exc)
+        return "No se pudo consultar el directorio de receptores. Pide la CSF del receptor."
+    if not encontrados:
+        return f"Sin receptores guardados que coincidan con '{texto}'. Pide la CSF del receptor."
+    return json.dumps(encontrados, ensure_ascii=False)
 
 
 def extract_text_from_response(response: anthropic.types.Message) -> Optional[str]:
@@ -440,6 +465,20 @@ def run_conversation_turn(
                     for b in response.content
                 ],
             })
+
+            if tool_name == TOOL_BUSCAR_RECEPTOR:
+                # Consulta, no pedido terminado: se responde y Claude sigue en
+                # este mismo turno (pide la CSF o continúa con los conceptos).
+                _log_uso_claude(f"{paso_base}→{tool_name}", response)
+                history.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_block.id,
+                        "content": _resultado_busqueda_receptor(profile, tool_input.get("texto", "")),
+                    }],
+                })
+                continue
 
             if tool_name in ("generate_invoice_draft", "generate_rep_draft", "request_invoice_cancellation"):
                 # Validate before doing anything fiscal

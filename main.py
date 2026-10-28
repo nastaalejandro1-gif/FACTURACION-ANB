@@ -20,7 +20,7 @@ from config import ALEJANDRO_CHAT_ID, CRON_SECRET, TELEGRAM_WEBHOOK_SECRET
 from escalation import EscalationReason
 from facturapi_client import (
     cancel_invoice, create_invoice, create_rep, download_pdf, download_xml, get_invoice,
-    search_invoice_by_uuid,
+    guardar_cliente, search_invoice_by_uuid,
 )
 from models import (
     MOTIVOS_CANCELACION,
@@ -662,6 +662,12 @@ async def _timbre_and_deliver(
 
     # A partir de aquí la factura YA está timbrada: un fallo en la descarga o
     # entrega NO debe registrarse como error (el cliente reintentaría y duplicaría).
+    try:
+        await guardar_cliente(invoice_data.receptor, facturapi_key)
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        # Solo es comodidad para la próxima factura (que pida la CSF de nuevo).
+        logger.warning("Factura %s timbrada pero no se guardó el receptor en FacturAPI: %s", invoice_id, exc)
+
     try:
         pdf_bytes = await download_pdf(folio, facturapi_key)
         xml_bytes = await download_xml(folio, facturapi_key)

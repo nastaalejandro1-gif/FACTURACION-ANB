@@ -6,11 +6,16 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 from config import FACTURAPI_BASE_URL
-from models import InvoiceData, RepData
+from models import InvoiceData, ReceptorData, RepData
 
 logger = logging.getLogger(__name__)
 
 TIMEOUT = 30.0
+
+# Público en general / residente en el extranjero: no son un receptor
+# concreto, no se guardan en el directorio de clientes de FacturAPI.
+RFC_GENERICOS = {"XAXX010101000", "XEXX010101000"}
+MAX_CLIENTES_BUSQUEDA = 5
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -273,6 +278,77 @@ async def search_invoice_by_uuid(uuid: str, facturapi_key: str) -> Optional[dict
             if str(inv.get("uuid", "")).upper() == uuid.upper():
                 return inv
         return None
+
+
+# ---------------------------------------------------------------------------
+# Directorio de clientes (receptores) de la organización en FacturAPI
+# ---------------------------------------------------------------------------
+
+def _customer_payload(receptor: ReceptorData) -> dict:
+    return {
+        "legal_name": receptor.razon_social,
+        "tax_id": receptor.rfc,
+        "tax_system": receptor.regimen_fiscal,
+        "address": {"zip": receptor.cp_fiscal},
+        "default_invoice_use": receptor.uso_cfdi,
+    }
+
+
+@_facturapi_retry
+async def guardar_cliente(receptor: ReceptorData, facturapi_key: str) -> None:
+    """
+    Alta o actualización del receptor en el directorio de clientes de la
+    organización, para que la próxima factura baste con su nombre (ver
+    buscar_clientes). Se llama solo tras timbrar: el SAT ya validó los datos.
+    Si el RFC ya existe se actualiza (cambio de régimen/CP, último uso CFDI).
+    """
+    if receptor.rfc in RFC_GENERICOS:
+        return
+    headers = {"Authorization": f"Bearer {facturapi_key}"}
+    payload = _customer_payload(receptor)
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        response = await client.get(
+            f"{FACTURAPI_BASE_URL}/customers",
+            params={"q": receptor.rfc},
+            headers=headers,
+        )
+        response.raise_for_status()
+        existente = next(
+            (c for c in response.json().get("data", []) if str(c.get("tax_id", "")).upper() == receptor.rfc),
+            None,
+        )
+        if existente:
+            response = await client.put(
+                f"{FACTURAPI_BASE_URL}/customers/{existente['id']}", json=payload, headers=headers,
+            )
+        else:
+            response = await client.post(f"{FACTURAPI_BASE_URL}/customers", json=payload, headers=headers)
+        response.raise_for_status()
+
+
+def buscar_clientes(texto: str, facturapi_key: str) -> list[dict]:
+    """
+    Busca receptores guardados por razón social o RFC (parcial). Síncrona:
+    se llama desde run_conversation_turn, que ya corre en un hilo aparte.
+    Devuelve los datos con los nombres de campo de ReceptorData.
+    """
+    response = httpx.get(
+        f"{FACTURAPI_BASE_URL}/customers",
+        params={"q": texto.strip(), "limit": MAX_CLIENTES_BUSQUEDA},
+        headers={"Authorization": f"Bearer {facturapi_key}"},
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+    return [
+        {
+            "razon_social": c.get("legal_name", ""),
+            "rfc": c.get("tax_id", ""),
+            "regimen_fiscal": c.get("tax_system", ""),
+            "cp_fiscal": (c.get("address") or {}).get("zip", ""),
+            "uso_cfdi": c.get("default_invoice_use") or "",
+        }
+        for c in response.json().get("data", [])[:MAX_CLIENTES_BUSQUEDA]
+    ]
 
 
 def _build_related_document_taxes(original_invoice: dict, monto_pagado: Decimal) -> list:

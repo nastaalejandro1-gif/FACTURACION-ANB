@@ -21,6 +21,8 @@ FORMAS_PAGO_ENUM_REP = [f for f in FORMAS_PAGO_ENUM if f != "99"]
 
 CLAVE_NUEVA = "NUEVA"
 
+TOOL_BUSCAR_RECEPTOR = "buscar_receptor_guardado"
+
 
 def build_invoice_tools(claves_catalogo: list[str], folios_cancelables: list[str] = ()) -> list[dict]:
     """
@@ -70,6 +72,28 @@ def build_invoice_tools(claves_catalogo: list[str], folios_cancelables: list[str
 
 def _invoice_tools(claves_enum: list[str]) -> list[dict]:
     return [
+        {
+            "name": TOOL_BUSCAR_RECEPTOR,
+            "description": (
+                "Busca en el directorio del cliente un receptor al que ya se le facturó antes "
+                "(se guarda solo tras timbrar con su CSF). Devuelve razón social, RFC, régimen, "
+                "CP y el último uso CFDI. Llamar cuando el cliente nombra al receptor (nombre o "
+                "RFC) y NO mandó su CSF."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "texto": {
+                        "type": "string",
+                        "description": (
+                            "Nombre o RFC del receptor tal como lo dio el cliente. Para nombres, usa "
+                            "la palabra más distintiva (ej. 'Envoy', no 'Grupo Envoy SA de CV')."
+                        ),
+                    },
+                },
+                "required": ["texto"],
+            },
+        },
         {
             "name": "generate_invoice_draft",
             "description": (
