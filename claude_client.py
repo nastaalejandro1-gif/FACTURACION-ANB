@@ -372,6 +372,11 @@ Emisores que puede usar:
 - Si nombra un emisor que no está en la lista, dile que no tiene permiso para facturar a nombre
   de ese cliente y que se lo pida a Alejandro. No uses otro emisor en su lugar.
 - En el resumen antes de confirmar, escribe primero "Emisor: {{nombre}} ({{RFC}})".
+- Si ninguna clave del catálogo de {profile.nombre_comercial} corresponde a los conceptos, ANTES de
+  proponer una clave NUEVA dile que está facturando como {profile.nombre_comercial} y pregúntale a
+  nombre de quién va la factura, mostrando los nombres de la lista de emisores. NO adivines ni
+  sugieras un emisor: que él lo diga. Si nombra otro, llama seleccionar_emisor; si confirma
+  {profile.nombre_comercial}, sigue con la clave NUEVA.
 """
 
 
@@ -565,6 +570,30 @@ def run_conversation_turn(
                         }],
                     })
                     continue  # let Claude retry
+
+                # Caso real: con la factura de un proveedor como ejemplo, el
+                # modelo copió al receptor del documento — que era el propio
+                # emisor — y armó una factura a sí mismo.
+                receptor = getattr(result_data, "receptor", None)
+                if receptor is not None and receptor.rfc.strip().upper() == profile.rfc.strip().upper():
+                    logger.warning("%s con receptor = emisor (%s), se pide corregir", tool_name, profile.rfc)
+                    _log_uso_claude(f"{paso_base}→retry_receptor_es_emisor", response)
+                    history.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_block.id,
+                            "content": (
+                                f"Error: el receptor no puede ser el mismo emisor ({profile.nombre_comercial}, "
+                                f"RFC {profile.rfc}). Si tomaste los datos de un documento donde el emisor "
+                                "aparece como receptor, el receptor de la factura nueva es la OTRA parte del "
+                                "documento. Si no está claro a quién se le factura, pregúntalo sin llamar la "
+                                "herramienta."
+                            ),
+                            "is_error": True,
+                        }],
+                    })
+                    continue
 
                 # Ahorro de costo: NO se hace una segunda llamada a la API solo
                 # para generar el texto de confirmación. Claude ya incluye ese
