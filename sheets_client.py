@@ -592,6 +592,7 @@ class ClaveCatalogo:
     descripcion_clave: str
     aplica_ieps: bool
     id_cliente: Optional[str]  # None = clave global del despacho
+    tasa_iva: Optional[Decimal] = None  # None = la de la regla del cliente
 
 
 def get_catalogo_claves(despacho_id: str, id_cliente: str) -> list[ClaveCatalogo]:
@@ -619,6 +620,7 @@ def get_catalogo_claves(despacho_id: str, id_cliente: str) -> list[ClaveCatalogo
             descripcion_clave=str(f["descripcion_clave"]),
             aplica_ieps=bool(f["aplica_ieps"]),
             id_cliente=f.get("id_cliente"),
+            tasa_iva=Decimal(str(f["tasa_iva"])) if f.get("tasa_iva") is not None else None,
         )
         for f in (propias + globales)
     ]
@@ -672,6 +674,13 @@ def get_fiscal_rules(despacho_id: str, id_cliente: str) -> FiscalRules:
 
     claves = get_catalogo_claves(despacho_id, id_cliente)
     claves_con_ieps = frozenset(c.clave_prod_serv for c in claves if c.aplica_ieps)
+    # Las propias van después de las globales: si una clave está en ambas,
+    # gana la del cliente.
+    tasa_iva_por_clave = {
+        c.clave_prod_serv: c.tasa_iva
+        for c in sorted(claves, key=lambda c: c.id_cliente is not None)
+        if c.tasa_iva is not None
+    }
 
     return FiscalRules(
         iva_aplica=bool(row["iva_aplica"]),
@@ -680,5 +689,6 @@ def get_fiscal_rules(despacho_id: str, id_cliente: str) -> FiscalRules:
         retencion_isr_tasa=Decimal(str(row["retencion_isr_tasa"])),
         ieps_tasa=Decimal(str(row["ieps_tasa"])),
         claves_con_ieps=claves_con_ieps,
+        tasa_iva_por_clave=tasa_iva_por_clave,
         monto_maximo_sin_autorizacion=Decimal(str(row.get("monto_maximo_sin_autorizacion") or "50000")),
     )

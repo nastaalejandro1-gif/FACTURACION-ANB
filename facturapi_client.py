@@ -111,16 +111,31 @@ def _calcular_tasas_retencion_efectivas(data: InvoiceData) -> tuple[Decimal, Dec
     (incluye IEPS) en vez de solo el subtotal.
     """
     base_efectiva_total = data.factura.monto_antes_impuestos + data.factura.ieps
+    # La retención de IVA solo va en las líneas que trasladan IVA (una línea
+    # al 0% no retiene), así que su base es la de esas líneas.
+    base_con_iva = sum(
+        (_base_concepto(c) for c in data.factura.conceptos if _tasa_iva_concepto(c, data) > 0),
+        Decimal("0"),
+    )
 
-    def _tasa_efectiva(monto: Decimal) -> Decimal:
-        if monto <= 0:
+    def _tasa_efectiva(monto: Decimal, base: Decimal) -> Decimal:
+        if monto <= 0 or base <= 0:
             return Decimal("0")
-        return (monto / base_efectiva_total).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+        return (monto / base).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
 
     return (
-        _tasa_efectiva(data.factura.retencion_iva),
-        _tasa_efectiva(data.factura.retencion_isr),
+        _tasa_efectiva(data.factura.retencion_iva, base_con_iva),
+        _tasa_efectiva(data.factura.retencion_isr, base_efectiva_total),
     )
+
+
+def _base_concepto(concepto) -> Decimal:
+    importe = (concepto.cantidad * concepto.precio_unitario).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return importe + concepto.ieps
+
+
+def _tasa_iva_concepto(concepto, data: InvoiceData) -> Decimal:
+    return concepto.tasa_iva if concepto.tasa_iva is not None else data.factura.tasa_iva
 
 
 def _build_taxes_for_concepto(concepto, data: InvoiceData, retenciones: tuple[Decimal, Decimal]) -> list:
@@ -140,15 +155,16 @@ def _build_taxes_for_concepto(concepto, data: InvoiceData, retenciones: tuple[De
 
     # Con IVA tasa 0% (alimentos básicos) también se traslada, con importe 0:
     # mandar `taxes` sin IVA haría el concepto "no objeto de impuesto".
-    if data.factura.iva > 0 or data.factura.iva_aplica:
+    tasa_iva = _tasa_iva_concepto(concepto, data)
+    if tasa_iva > 0 or data.factura.iva_aplica:
         taxes.append({
             "type": "IVA",
-            "rate": float(data.factura.tasa_iva),
+            "rate": float(tasa_iva),
             "factor": "Tasa",
             "withholding": False,
         })
 
-    if data.factura.retencion_iva > 0:
+    if data.factura.retencion_iva > 0 and tasa_iva > 0:
         taxes.append({
             "type": "IVA",
             "rate": float(retencion_iva_rate),

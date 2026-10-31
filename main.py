@@ -544,6 +544,7 @@ def _build_invoice_data(draft: InvoiceDraft, client_profile, calculada: fiscal_e
             precio_unitario=cc.precio_unitario,
             ieps=cc.ieps,
             ieps_tasa=cc.ieps_tasa,
+            tasa_iva=cc.tasa_iva,
         )
         for cc in calculada.conceptos
     ]

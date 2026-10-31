@@ -405,3 +405,33 @@ def test_caso_envoy_total_con_iva_no_escala():
         total_documento_fuente=Decimal("37463.94"),
     )
     assert resultado.escalation is None or resultado.escalation.reason != EscalationReason.VALIDACION_ARITMETICA
+
+
+# Sin Culpa (31 oct 2026): snacks al 0% con IEPS 8%, el envío al 16%. Antes
+# había una sola tasa de IVA por cliente y se aplicaba a todas las líneas.
+REGLAS_IVA_MIXTO = FiscalRules(
+    iva_aplica=True,
+    tasa_iva=Decimal("0"),
+    retencion_iva_tasa=Decimal("0.106667"),
+    retencion_isr_tasa=Decimal("0"),
+    ieps_tasa=Decimal("0.08"),
+    claves_con_ieps=frozenset({"50192100"}),
+    tasa_iva_por_clave={"78102205": Decimal("0.16")},
+)
+
+
+def test_iva_por_clave_snacks_al_cero_y_envio_al_16():
+    conceptos = [
+        ConceptoExtraido("CHIPS JICAMA 120 GR", Decimal("24"), Decimal("58.3333"), "H87", "50192100"),
+        ConceptoExtraido("ENVIO", Decimal("1"), Decimal("500.00"), "E48", "78102205"),
+    ]
+    f = calcular_factura(conceptos, RECEPTOR_PM, REGLAS_IVA_MIXTO, "PUE", "03").factura
+    snacks, envio = f.conceptos
+    assert snacks.importe == Decimal("1400.00")
+    assert snacks.ieps == Decimal("112.00")
+    assert snacks.tasa_iva == Decimal("0")
+    assert envio.tasa_iva == Decimal("0.16")
+    assert f.iva == Decimal("80.00")  # solo el envío
+    # La retención de IVA solo sale de la línea con IVA.
+    assert f.retencion_iva == Decimal("53.33")
+    assert f.total == Decimal("1400.00") + Decimal("112.00") + Decimal("500.00") + Decimal("80.00") - Decimal("53.33")

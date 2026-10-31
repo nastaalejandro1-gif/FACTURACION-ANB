@@ -294,3 +294,33 @@ def test_iva_tasa_cero_se_traslada_al_cero_por_ciento():
 def test_sin_iva_no_manda_traslado():
     data = _invoice([HUEVO], tasa_iva=Decimal("0"), iva_aplica=False)
     assert _build_facturapi_payload(data)["items"][0]["product"]["taxes"] == []
+
+
+def test_iva_por_concepto_se_manda_con_la_tasa_de_cada_linea():
+    conceptos = [
+        ConceptoItem(
+            descripcion="Chips", clave_prod_serv="50192100", cantidad=Decimal("24"),
+            precio_unitario=Decimal("58.3333"), ieps=Decimal("112.00"), ieps_tasa=Decimal("0.08"),
+            tasa_iva=Decimal("0"),
+        ),
+        ConceptoItem(
+            descripcion="Envio", clave_prod_serv="78102205", cantidad=Decimal("1"),
+            precio_unitario=Decimal("500.00"), tasa_iva=Decimal("0.16"),
+        ),
+    ]
+    invoice_data = _invoice(
+        conceptos, monto_antes_impuestos=Decimal("1900.00"),
+        iva=Decimal("80.00"), tasa_iva=Decimal("0"),
+        retencion_iva=Decimal("53.33"), retencion_iva_tasa=Decimal("0.106667"),
+    )
+    items = _build_facturapi_payload(invoice_data)["items"]
+    chips_taxes, envio_taxes = (i["product"]["taxes"] for i in items)
+
+    chips_iva = [t for t in chips_taxes if t["type"] == "IVA"]
+    assert chips_iva == [{"type": "IVA", "rate": 0.0, "factor": "Tasa", "withholding": False}]
+
+    envio_iva = next(t for t in envio_taxes if t["type"] == "IVA" and not t["withholding"])
+    envio_ret = next(t for t in envio_taxes if t["type"] == "IVA" and t["withholding"])
+    assert envio_iva["rate"] == 0.16
+    # FacturAPI reconstruye la retención solo sobre la base del envío.
+    assert abs(Decimal("500.00") * Decimal(str(envio_ret["rate"])) - Decimal("53.33")) < Decimal("0.01")

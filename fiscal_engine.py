@@ -17,9 +17,9 @@ depender de esto para clientes reales.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Optional
+from typing import Mapping, Optional
 
 from escalation import EscalationDetail, EscalationReason
 from models import ReceptorData
@@ -58,6 +58,10 @@ class FiscalRules:
     # solo para no romper construcciones existentes (tests, etc.) — el
     # valor real siempre viene de reglas_fiscales_cliente.
     monto_maximo_sin_autorizacion: Decimal = Decimal("50000")
+    # Tasa de IVA propia de una clave (catalogo_clave_prod_serv.tasa_iva), para
+    # facturas con tasas mezcladas: ej. Sin Culpa vende snacks al 0% y el
+    # envío va al 16%. Clave ausente = tasa_iva de la regla del cliente.
+    tasa_iva_por_clave: Mapping[str, Decimal] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +78,7 @@ class ConceptoCalculado:
     importe: Decimal
     ieps: Decimal
     ieps_tasa: Decimal  # tasa realmente aplicada a este concepto (0 si no gravado)
+    tasa_iva: Decimal = Decimal("0")  # tasa de IVA de esta línea
 
 
 @dataclass(frozen=True)
@@ -177,7 +182,8 @@ def calcular_factura(
     # la tasa sobre la base (0.106667 = 2/3 del IVA), redondeada por línea
     # como FacturAPI. Antes se calculaba iva * tasa — retenía ~1.7% del
     # subtotal en vez de 10.6667%.
-    tasa_ret_iva = reglas.retencion_iva_tasa if (tipo_persona == "PM" and tasa_iva > 0) else Decimal("0")
+    # Por línea: un concepto al 0% no lleva retención de IVA.
+    tasa_ret_iva = reglas.retencion_iva_tasa if tipo_persona == "PM" else Decimal("0")
 
     conceptos_calculados: list[ConceptoCalculado] = []
     iva_total = Decimal("0.00")
@@ -187,9 +193,11 @@ def calcular_factura(
         aplica_ieps = c.clave_prod_serv in reglas.claves_con_ieps
         ieps_tasa_concepto = reglas.ieps_tasa if aplica_ieps else Decimal("0")
         ieps_concepto = _redondear(importe * ieps_tasa_concepto) if aplica_ieps else Decimal("0.00")
-        iva_concepto = _redondear((importe + ieps_concepto) * tasa_iva)
+        tasa_iva_concepto = reglas.tasa_iva_por_clave.get(c.clave_prod_serv, tasa_iva)
+        iva_concepto = _redondear((importe + ieps_concepto) * tasa_iva_concepto)
         iva_total += iva_concepto
-        retencion_iva_total += _redondear((importe + ieps_concepto) * tasa_ret_iva)
+        if tasa_iva_concepto > 0:
+            retencion_iva_total += _redondear((importe + ieps_concepto) * tasa_ret_iva)
         conceptos_calculados.append(ConceptoCalculado(
             descripcion=c.descripcion,
             clave_prod_serv=c.clave_prod_serv,
@@ -199,6 +207,7 @@ def calcular_factura(
             importe=importe,
             ieps=ieps_concepto,
             ieps_tasa=ieps_tasa_concepto,
+            tasa_iva=tasa_iva_concepto,
         ))
 
     subtotal = sum((cc.importe for cc in conceptos_calculados), Decimal("0.00"))
@@ -206,7 +215,7 @@ def calcular_factura(
     iva = iva_total
 
     if tipo_persona == "PM":
-        retencion_iva_tasa = tasa_ret_iva
+        retencion_iva_tasa = tasa_ret_iva if retencion_iva_total > 0 else Decimal("0")
         retencion_isr_tasa = reglas.retencion_isr_tasa
         retencion_iva = retencion_iva_total
         retencion_isr = _redondear(subtotal * retencion_isr_tasa)

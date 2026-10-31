@@ -166,6 +166,9 @@ class ConceptoItem(BaseModel):
     precio_unitario: Decimal = Field(gt=0)
     ieps: Decimal = Field(ge=0, default=Decimal("0"))
     ieps_tasa: Decimal = Field(ge=0, default=Decimal("0"))  # tasa aplicada (0 si no gravado)
+    # Tasa de IVA de la línea. None = factura.tasa_iva (pendientes guardados
+    # antes de que hubiera tasa por concepto).
+    tasa_iva: Optional[Decimal] = Field(ge=0, default=None)
 
 
 class FacturaData(BaseModel):
