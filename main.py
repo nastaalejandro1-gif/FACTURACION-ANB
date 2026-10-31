@@ -763,7 +763,7 @@ def _detalle_para_revision(
         clave = c.clave_prod_serv
         if clave == tools.CLAVE_NUEVA:
             clave = f"NUEVA → {c.clave_prod_serv_propuesta}"
-        importe = Decimal(str(c.cantidad)) * Decimal(str(c.precio_unitario))
+        importe = fiscal_engine._redondear(Decimal(str(c.cantidad)) * Decimal(str(c.precio_unitario)))
         lineas.append(
             f"• {e(c.descripcion)}\n"
             f"   {c.cantidad:g} {e(c.clave_unidad)} × ${c.precio_unitario:,.2f} = ${importe:,.2f} · Clave {e(clave)}"
@@ -785,7 +785,7 @@ def _detalle_para_revision(
         lineas.append(f"<b>Total: ${v.total:,.2f}</b>")
     else:
         subtotal = sum(
-            (Decimal(str(c.cantidad)) * Decimal(str(c.precio_unitario)) for c in f.conceptos),
+            (fiscal_engine._redondear(Decimal(str(c.cantidad)) * Decimal(str(c.precio_unitario))) for c in f.conceptos),
             Decimal("0"),
         )
         lineas.append(f"Subtotal: ${subtotal:,.2f} (los impuestos se calculan al aprobar)")

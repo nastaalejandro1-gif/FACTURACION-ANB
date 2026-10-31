@@ -1,5 +1,5 @@
 import re
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -196,7 +196,13 @@ class FacturaData(BaseModel):
 
     @model_validator(mode="after")
     def validate_monto_conceptos(self) -> "FacturaData":
-        suma = sum((c.cantidad * c.precio_unitario for c in self.conceptos), Decimal("0"))
+        # Importe redondeado a centavo por concepto, igual que fiscal_engine:
+        # con precio_unitario de más de 2 decimales (ej. total / cantidad) la
+        # suma sin redondear nunca cuadra con el subtotal.
+        suma = sum(
+            ((c.cantidad * c.precio_unitario).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) for c in self.conceptos),
+            Decimal("0"),
+        )
         if suma != self.monto_antes_impuestos:
             raise ValueError(
                 f"monto_antes_impuestos ({self.monto_antes_impuestos}) no coincide "

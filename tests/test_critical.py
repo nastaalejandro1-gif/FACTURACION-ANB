@@ -313,3 +313,32 @@ def test_rfc_with_spaces_rejected():
             cp_fiscal="06600",
             uso_cfdi="G03",
         )
+
+
+def test_precio_unitario_con_mas_de_dos_decimales_cuadra_con_el_motor():
+    # Caso real (31 oct 2026): precio_unitario con 6 decimales; el motor
+    # redondea el importe por concepto y el validador sumaba sin redondear.
+    from fiscal_engine import ConceptoExtraido, FiscalRules, calcular_factura
+    from main import _build_invoice_data
+    from types import SimpleNamespace
+
+    reglas = FiscalRules(
+        iva_aplica=True, tasa_iva=Decimal("0.16"), retencion_iva_tasa=Decimal("0"),
+        retencion_isr_tasa=Decimal("0"), ieps_tasa=Decimal("0"), claves_con_ieps=frozenset(),
+    )
+    receptor = ReceptorData(
+        rfc="XAXX010101000", razon_social="PUBLICO EN GENERAL", regimen_fiscal="616",
+        cp_fiscal="06300", uso_cfdi="S01",
+    )
+    resultado = calcular_factura(
+        [ConceptoExtraido("Servicio", Decimal("1"), Decimal("12909.762248"), "E48", "80101500")],
+        receptor, reglas, "PUE", "03",
+    )
+    assert resultado.factura.subtotal == Decimal("12909.76")
+    draft = SimpleNamespace(factura=SimpleNamespace(observaciones=""), receptor=receptor)
+    perfil = SimpleNamespace(
+        nombre_comercial="X", razon_social="X", rfc="XAXX010101000", regimen_fiscal="601",
+        cp_fiscal="06300", id_cliente="1", operador_canal_id=None,
+    )
+    data = _build_invoice_data(draft, perfil, resultado.factura)
+    assert data.factura.monto_antes_impuestos == Decimal("12909.76")
