@@ -263,6 +263,10 @@ B) COTIZACIÓN / PRESUPUESTO: documento con lista de servicios o productos, cant
        LTR=Litro, MTR=Metro, etc.
      Si no puedes inferirlo, usa H87 para productos y E48 para servicios.
    - clave_prod_serv: del catálogo del cliente de arriba (o "NUEVA", ver instrucciones arriba).
+   - cuenta_predial: si el concepto es RENTA de un inmueble (claves 80131500-80131503), el CFDI
+     debe llevar el número de cuenta predial de ESE inmueble. Puede cambiar en cada factura:
+     pídelo siempre (junto con lo demás que falte) salvo que el cliente ya lo haya escrito en
+     esta factura. NUNCA lo inventes ni reuses el de otra factura.
    - Si el documento muestra un TOTAL explícito, captúralo en total_documento_fuente —
      el sistema lo usa para verificar que no se te haya escapado un concepto.
    Después de extraer, muestra lo que encontraste (SIN calcular impuestos ni total) y

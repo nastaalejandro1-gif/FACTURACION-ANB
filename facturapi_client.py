@@ -57,8 +57,9 @@ def _build_facturapi_payload(data: InvoiceData) -> dict:
     """
     retenciones = _calcular_tasas_retencion_efectivas(data)
 
-    items = [
-        {
+    items = []
+    for concepto in data.factura.conceptos:
+        item = {
             "quantity": float(concepto.cantidad),
             "product": {
                 "description": concepto.descripcion,
@@ -69,8 +70,9 @@ def _build_facturapi_payload(data: InvoiceData) -> dict:
                 "taxes": _build_taxes_for_concepto(concepto, data, retenciones),
             },
         }
-        for concepto in data.factura.conceptos
-    ]
+        if concepto.cuenta_predial:
+            item["property_tax_account"] = list(concepto.cuenta_predial)
+        items.append(item)
 
     # SAT rule: PPD always requires forma_pago = 99 (Por Definir)
     forma_pago = "99" if data.factura.metodo_pago == "PPD" else data.factura.forma_pago

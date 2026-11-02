@@ -43,6 +43,7 @@ class ConceptoExtraido:
     precio_unitario: Decimal
     clave_unidad: str
     clave_prod_serv: str
+    cuenta_predial: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,7 @@ class ConceptoCalculado:
     ieps: Decimal
     ieps_tasa: Decimal  # tasa realmente aplicada a este concepto (0 si no gravado)
     tasa_iva: Decimal = Decimal("0")  # tasa de IVA de esta línea
+    cuenta_predial: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -208,6 +210,7 @@ def calcular_factura(
             ieps=ieps_concepto,
             ieps_tasa=ieps_tasa_concepto,
             tasa_iva=tasa_iva_concepto,
+            cuenta_predial=c.cuenta_predial,
         ))
 
     subtotal = sum((cc.importe for cc in conceptos_calculados), Decimal("0.00"))

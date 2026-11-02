@@ -188,6 +188,15 @@ def _invoice_tools(claves_enum: list[str]) -> list[dict]:
                                                 "despacho una sola vez."
                                             ),
                                         },
+                                        "cuenta_predial": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                            "description": (
+                                                "Número(s) de cuenta predial del inmueble, tal como los "
+                                                "dio el cliente. OBLIGATORIO si el concepto es renta de un "
+                                                "inmueble (claves 80131500-80131503); omítelo en los demás."
+                                            ),
+                                        },
                                     },
                                     "required": ["descripcion", "cantidad", "clave_unidad", "precio_unitario", "clave_prod_serv"],
                                 },

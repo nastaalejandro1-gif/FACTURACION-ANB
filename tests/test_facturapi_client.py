@@ -324,3 +324,16 @@ def test_iva_por_concepto_se_manda_con_la_tasa_de_cada_linea():
     assert envio_iva["rate"] == 0.16
     # FacturAPI reconstruye la retención solo sobre la base del envío.
     assert abs(Decimal("500.00") * Decimal(str(envio_ret["rate"])) - Decimal("53.33")) < Decimal("0.01")
+
+
+def test_cuenta_predial_va_en_el_item():
+    # Verificado en sandbox (2 nov 2026): el XML trae <cfdi:CuentaPredial Numero=.../>.
+    conceptos = [
+        ConceptoItem(descripcion="Renta", clave_prod_serv="80131502", cantidad=Decimal("1"),
+                     precio_unitario=Decimal("10000"), cuenta_predial=["D65020110012"]),
+        ConceptoItem(descripcion="Mantenimiento", clave_prod_serv="72101500", cantidad=Decimal("1"),
+                     precio_unitario=Decimal("500")),
+    ]
+    items = _build_facturapi_payload(_invoice(conceptos))["items"]
+    assert items[0]["property_tax_account"] == ["D65020110012"]
+    assert "property_tax_account" not in items[1]

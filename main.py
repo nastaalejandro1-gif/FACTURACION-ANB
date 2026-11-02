@@ -545,6 +545,7 @@ def _build_invoice_data(draft: InvoiceDraft, client_profile, calculada: fiscal_e
             ieps=cc.ieps,
             ieps_tasa=cc.ieps_tasa,
             tasa_iva=cc.tasa_iva,
+            cuenta_predial=list(cc.cuenta_predial),
         )
         for cc in calculada.conceptos
     ]
@@ -633,6 +634,7 @@ async def _calcular_y_procesar_factura(
             precio_unitario=Decimal(str(c.precio_unitario)),
             clave_unidad=c.clave_unidad,
             clave_prod_serv=c.clave_prod_serv,
+            cuenta_predial=tuple(c.cuenta_predial),
         )
         for c in draft.factura.conceptos
     ]
@@ -768,6 +770,7 @@ def _detalle_para_revision(
         lineas.append(
             f"• {e(c.descripcion)}\n"
             f"   {c.cantidad:g} {e(c.clave_unidad)} × ${c.precio_unitario:,.2f} = ${importe:,.2f} · Clave {e(clave)}"
+            + (f"\n   Cuenta predial: {e(', '.join(c.cuenta_predial))}" if c.cuenta_predial else "")
         )
     if len(f.conceptos) > MAX_CONCEPTOS_EN_REVISION:
         lineas.append(f"… y {len(f.conceptos) - MAX_CONCEPTOS_EN_REVISION} conceptos más")
@@ -923,7 +926,9 @@ async def _solicitar_confirmacion_cliente(
     )
     f = invoice_data.factura
     conceptos_texto = "\n".join(
-        f"  • {c.descripcion} — {c.cantidad} x ${c.precio_unitario:,.2f}" for c in f.conceptos
+        f"  • {c.descripcion} — {c.cantidad} x ${c.precio_unitario:,.2f}"
+        + (f" (predial {', '.join(c.cuenta_predial)})" if c.cuenta_predial else "")
+        for c in f.conceptos
     )
     receptor = invoice_data.receptor
     lineas = [

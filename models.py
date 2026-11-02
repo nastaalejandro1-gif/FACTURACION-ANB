@@ -5,6 +5,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 RFC_PATTERN = re.compile(r"^[A-Z&Ñ]{3,4}\d{6}[A-Z0-9]{3}$")
 
+# Claves SAT de arrendamiento de inmuebles: el CFDI lleva CuentaPredial.
+CLAVES_ARRENDAMIENTO_INMUEBLE = {"80131500", "80131501", "80131502", "80131503"}
+
 # Catálogo SAT — claves válidas de forma_pago
 FORMAS_PAGO_VALIDAS = {
     "01", "02", "03", "04", "05", "06", "08",
@@ -55,6 +58,25 @@ class ConceptoDraft(BaseModel):
     # encontró ninguna clave del catálogo que aplique al concepto.
     clave_prod_serv: str
     clave_prod_serv_propuesta: str = ""  # obligatorio si clave_prod_serv == "NUEVA"
+    # CuentaPredial del CFDI: obligatoria al facturar renta de un inmueble.
+    # Varía por inmueble, así que se pide en cada factura (decisión de ANB).
+    cuenta_predial: list[str] = Field(default_factory=list)
+
+    @field_validator("cuenta_predial")
+    @classmethod
+    def limpiar_cuenta_predial(cls, v: list[str]) -> list[str]:
+        return [n.strip() for n in v if n and n.strip()]
+
+    @model_validator(mode="after")
+    def validate_predial_en_arrendamiento(self) -> "ConceptoDraft":
+        clave = self.clave_prod_serv_propuesta if self.clave_prod_serv == "NUEVA" else self.clave_prod_serv
+        if clave in CLAVES_ARRENDAMIENTO_INMUEBLE and not self.cuenta_predial:
+            raise ValueError(
+                f"El concepto '{self.descripcion}' es renta de un inmueble (clave {clave}) y el CFDI "
+                "debe llevar el número de cuenta predial. Pídeselo al cliente sin llamar la "
+                "herramienta; NUNCA lo inventes."
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_clave_nueva_requiere_propuesta(self) -> "ConceptoDraft":
@@ -169,6 +191,7 @@ class ConceptoItem(BaseModel):
     # Tasa de IVA de la línea. None = factura.tasa_iva (pendientes guardados
     # antes de que hubiera tasa por concepto).
     tasa_iva: Optional[Decimal] = Field(ge=0, default=None)
+    cuenta_predial: list[str] = Field(default_factory=list)
 
 
 class FacturaData(BaseModel):
