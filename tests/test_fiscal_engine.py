@@ -435,3 +435,51 @@ def test_iva_por_clave_snacks_al_cero_y_envio_al_16():
     # La retención de IVA solo sale de la línea con IVA.
     assert f.retencion_iva == Decimal("53.33")
     assert f.total == Decimal("1400.00") + Decimal("112.00") + Decimal("500.00") + Decimal("80.00") - Decimal("53.33")
+
+
+# Zepeda (2 nov 2026): la clave 80131500 cubre casa y local; el IVA sale del
+# uso del inmueble. Casa habitación sin amueblar = exenta (art. 20 LIVA).
+REGLAS_RESICO_SERVICIOS = FiscalRules(
+    iva_aplica=True,
+    tasa_iva=Decimal("0.16"),
+    retencion_iva_tasa=Decimal("0.106667"),
+    retencion_isr_tasa=Decimal("0.0125"),
+    ieps_tasa=Decimal("0"),
+    claves_con_ieps=frozenset(),
+)
+
+
+def _renta(uso, iva_en_documento=None, precio="10000"):
+    return ConceptoExtraido("Renta", Decimal("1"), Decimal(precio), "E48", "80131500",
+                            ("4U55241",), uso, iva_en_documento)
+
+
+def test_renta_casa_habitacion_exenta_sin_retencion_de_iva():
+    f = calcular_factura([_renta("casa_habitacion")], RECEPTOR_PM, REGLAS_RESICO_SERVICIOS, "PUE", "03").factura
+    assert f.conceptos[0].iva_exento is True
+    assert f.iva == Decimal("0.00")
+    assert f.retencion_iva == Decimal("0.00")
+    assert f.retencion_isr == Decimal("125.00")  # ISR RESICO sí se retiene
+    assert f.total == Decimal("9875.00")
+
+
+def test_renta_local_y_casa_amueblada_llevan_iva():
+    for uso in ("otro", "casa_amueblada"):
+        f = calcular_factura([_renta(uso)], RECEPTOR_PM, REGLAS_RESICO_SERVICIOS, "PUE", "03").factura
+        assert f.conceptos[0].iva_exento is False
+        assert f.iva == Decimal("1600.00")
+        assert f.retencion_iva == Decimal("1066.67")
+
+
+def test_iva_del_documento_distinto_al_del_inmueble_escala():
+    r = calcular_factura([_renta("casa_habitacion", iva_en_documento=True)], RECEPTOR_PF,
+                         REGLAS_RESICO_SERVICIOS, "PUE", "03")
+    assert r.escalation.reason == EscalationReason.VALIDACION_ARITMETICA
+    assert "documento cobra IVA" in r.escalation.detail
+    # Coincide -> no escala.
+    assert calcular_factura([_renta("otro", iva_en_documento=True)], RECEPTOR_PF,
+                            REGLAS_RESICO_SERVICIOS, "PUE", "03").escalation is None
+    # ANB ya revisó -> pasa.
+    assert calcular_factura([_renta("casa_habitacion", iva_en_documento=True)], RECEPTOR_PF,
+                            REGLAS_RESICO_SERVICIOS, "PUE", "03",
+                            omitir_validacion_cruzada=True).factura.iva == Decimal("0.00")

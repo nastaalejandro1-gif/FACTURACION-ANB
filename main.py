@@ -526,6 +526,13 @@ async def _perfil_de_pendiente(pending: dict, id_cliente_emisor: str = "") -> Op
 # Factura de ingreso — cálculo, escalamiento, confirmación del cliente
 # ---------------------------------------------------------------------------
 
+USO_INMUEBLE_TEXTO = {
+    "casa_habitacion": "casa habitación (IVA exento)",
+    "casa_amueblada": "casa amueblada (IVA 16%)",
+    "otro": "local / oficina / otro (IVA 16%)",
+}
+
+
 def _build_invoice_data(draft: InvoiceDraft, client_profile, calculada: fiscal_engine.FacturaCalculada) -> InvoiceData:
     emisor = EmisorData(
         nombre_comercial=client_profile.nombre_comercial,
@@ -546,6 +553,8 @@ def _build_invoice_data(draft: InvoiceDraft, client_profile, calculada: fiscal_e
             ieps_tasa=cc.ieps_tasa,
             tasa_iva=cc.tasa_iva,
             cuenta_predial=list(cc.cuenta_predial),
+            iva_exento=cc.iva_exento,
+            uso_inmueble=cc.uso_inmueble,
         )
         for cc in calculada.conceptos
     ]
@@ -635,6 +644,8 @@ async def _calcular_y_procesar_factura(
             clave_unidad=c.clave_unidad,
             clave_prod_serv=c.clave_prod_serv,
             cuenta_predial=tuple(c.cuenta_predial),
+            uso_inmueble=c.uso_inmueble,
+            iva_en_documento=c.iva_en_documento,
         )
         for c in draft.factura.conceptos
     ]
@@ -771,6 +782,7 @@ def _detalle_para_revision(
             f"• {e(c.descripcion)}\n"
             f"   {c.cantidad:g} {e(c.clave_unidad)} × ${c.precio_unitario:,.2f} = ${importe:,.2f} · Clave {e(clave)}"
             + (f"\n   Cuenta predial: {e(', '.join(c.cuenta_predial))}" if c.cuenta_predial else "")
+            + (f"\n   Inmueble: {USO_INMUEBLE_TEXTO.get(c.uso_inmueble, c.uso_inmueble)}" if c.uso_inmueble else "")
         )
     if len(f.conceptos) > MAX_CONCEPTOS_EN_REVISION:
         lineas.append(f"… y {len(f.conceptos) - MAX_CONCEPTOS_EN_REVISION} conceptos más")
@@ -928,6 +940,7 @@ async def _solicitar_confirmacion_cliente(
     conceptos_texto = "\n".join(
         f"  • {c.descripcion} — {c.cantidad} x ${c.precio_unitario:,.2f}"
         + (f" (predial {', '.join(c.cuenta_predial)})" if c.cuenta_predial else "")
+        + (" — IVA exento" if c.iva_exento else "")
         for c in f.conceptos
     )
     receptor = invoice_data.receptor

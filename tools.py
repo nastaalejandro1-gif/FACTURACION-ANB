@@ -197,6 +197,25 @@ def _invoice_tools(claves_enum: list[str]) -> list[dict]:
                                                 "inmueble (claves 80131500-80131503); omítelo en los demás."
                                             ),
                                         },
+                                        "uso_inmueble": {
+                                            "type": "string",
+                                            "enum": ["casa_habitacion", "casa_amueblada", "otro"],
+                                            "description": (
+                                                "OBLIGATORIO en renta de inmueble (claves 80131500-80131503): "
+                                                "casa_habitacion = casa/departamento sin amueblar (IVA exento); "
+                                                "casa_amueblada; otro = local, oficina, bodega, terreno, etc. "
+                                                "Lo decide lo que diga el cliente, no lo supongas."
+                                            ),
+                                        },
+                                        "iva_en_documento": {
+                                            "type": "boolean",
+                                            "description": (
+                                                "Solo si el cliente mandó un documento (cotización/recibo) o "
+                                                "escribió explícitamente '+ IVA' / 'sin IVA' para este "
+                                                "concepto: true si le cobra IVA, false si dice que no lleva. "
+                                                "Omítelo si no lo indica. Es solo verificación."
+                                            ),
+                                        },
                                     },
                                     "required": ["descripcion", "cantidad", "clave_unidad", "precio_unitario", "clave_prod_serv"],
                                 },

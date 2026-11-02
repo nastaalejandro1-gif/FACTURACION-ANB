@@ -158,7 +158,10 @@ def _build_taxes_for_concepto(concepto, data: InvoiceData, retenciones: tuple[De
     # Con IVA tasa 0% (alimentos básicos) también se traslada, con importe 0:
     # mandar `taxes` sin IVA haría el concepto "no objeto de impuesto".
     tasa_iva = _tasa_iva_concepto(concepto, data)
-    if tasa_iva > 0 or data.factura.iva_aplica:
+    if getattr(concepto, "iva_exento", False):
+        # FacturAPI exige rate aun con factor Exento (400 sin él, sandbox 2 nov 2026).
+        taxes.append({"type": "IVA", "rate": 0.0, "factor": "Exento", "withholding": False})
+    elif tasa_iva > 0 or data.factura.iva_aplica:
         taxes.append({
             "type": "IVA",
             "rate": float(tasa_iva),

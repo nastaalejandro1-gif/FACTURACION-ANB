@@ -267,6 +267,11 @@ B) COTIZACIÓN / PRESUPUESTO: documento con lista de servicios o productos, cant
      debe llevar el número de cuenta predial de ESE inmueble. Puede cambiar en cada factura:
      pídelo siempre (junto con lo demás que falte) salvo que el cliente ya lo haya escrito en
      esta factura. NUNCA lo inventes ni reuses el de otra factura.
+     En esa misma renta pregunta también qué es el inmueble (uso_inmueble): casa habitación
+     sin amueblar, casa amueblada, o local/oficina/otro — salvo que el cliente ya lo haya dicho
+     ("renta de la casa", "renta del local"). Una casa sin aclarar si está amueblada: pregunta.
+     Si el documento o el mensaje dice si la línea lleva IVA ("+ IVA", "IVA 16%", "sin IVA",
+     "exento"), anótalo en iva_en_documento; si no lo dice, omítelo. NO calcules el IVA.
    - Si el documento muestra un TOTAL explícito, captúralo en total_documento_fuente —
      el sistema lo usa para verificar que no se te haya escapado un concepto.
    Después de extraer, muestra lo que encontraste (SIN calcular impuestos ni total) y

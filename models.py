@@ -61,6 +61,14 @@ class ConceptoDraft(BaseModel):
     # CuentaPredial del CFDI: obligatoria al facturar renta de un inmueble.
     # Varía por inmueble, así que se pide en cada factura (decisión de ANB).
     cuenta_predial: list[str] = Field(default_factory=list)
+    # Renta de inmueble: casa habitación sin amueblar va EXENTA de IVA (art. 20
+    # LIVA); amueblada, local u oficina, al 16%. La clave genérica 80131500 no
+    # lo distingue, así que se pregunta en cada factura.
+    uso_inmueble: Optional[Literal["casa_habitacion", "casa_amueblada", "otro"]] = None
+    # Si el documento fuente muestra IVA en esta línea (True), dice "sin IVA" /
+    # "exento" (False), o no lo indica (None). Solo verifica: el IVA lo decide
+    # el motor y si no coincide se escala.
+    iva_en_documento: Optional[bool] = None
 
     @field_validator("cuenta_predial")
     @classmethod
@@ -75,6 +83,12 @@ class ConceptoDraft(BaseModel):
                 f"El concepto '{self.descripcion}' es renta de un inmueble (clave {clave}) y el CFDI "
                 "debe llevar el número de cuenta predial. Pídeselo al cliente sin llamar la "
                 "herramienta; NUNCA lo inventes."
+            )
+        if clave in CLAVES_ARRENDAMIENTO_INMUEBLE and self.uso_inmueble is None:
+            raise ValueError(
+                f"El concepto '{self.descripcion}' es renta de un inmueble (clave {clave}): falta "
+                "uso_inmueble. Pregúntale al cliente si es casa habitación sin amueblar, casa "
+                "amueblada, o local/oficina/otro, sin llamar la herramienta; no lo supongas."
             )
         return self
 
@@ -192,6 +206,8 @@ class ConceptoItem(BaseModel):
     # antes de que hubiera tasa por concepto).
     tasa_iva: Optional[Decimal] = Field(ge=0, default=None)
     cuenta_predial: list[str] = Field(default_factory=list)
+    iva_exento: bool = False  # se traslada IVA con TipoFactor Exento
+    uso_inmueble: Optional[str] = None
 
 
 class FacturaData(BaseModel):

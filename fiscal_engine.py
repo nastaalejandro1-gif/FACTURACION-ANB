@@ -44,6 +44,8 @@ class ConceptoExtraido:
     clave_unidad: str
     clave_prod_serv: str
     cuenta_predial: tuple[str, ...] = ()
+    uso_inmueble: Optional[str] = None  # ver models.ConceptoDraft.uso_inmueble
+    iva_en_documento: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,8 @@ class ConceptoCalculado:
     ieps_tasa: Decimal  # tasa realmente aplicada a este concepto (0 si no gravado)
     tasa_iva: Decimal = Decimal("0")  # tasa de IVA de esta línea
     cuenta_predial: tuple[str, ...] = ()
+    iva_exento: bool = False
+    uso_inmueble: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +192,7 @@ def calcular_factura(
     tasa_ret_iva = reglas.retencion_iva_tasa if tipo_persona == "PM" else Decimal("0")
 
     conceptos_calculados: list[ConceptoCalculado] = []
+    discrepancias_iva: list[str] = []
     iva_total = Decimal("0.00")
     retencion_iva_total = Decimal("0.00")
     for c in conceptos:
@@ -196,6 +201,19 @@ def calcular_factura(
         ieps_tasa_concepto = reglas.ieps_tasa if aplica_ieps else Decimal("0")
         ieps_concepto = _redondear(importe * ieps_tasa_concepto) if aplica_ieps else Decimal("0.00")
         tasa_iva_concepto = reglas.tasa_iva_por_clave.get(c.clave_prod_serv, tasa_iva)
+        # Renta de casa habitación sin amueblar: exenta (art. 20 fr. II LIVA).
+        iva_exento = c.uso_inmueble == "casa_habitacion"
+        if iva_exento:
+            tasa_iva_concepto = Decimal("0")
+        elif c.uso_inmueble is not None and tasa_iva_concepto == 0:
+            # Amueblada, local u oficina: gravada aunque la regla del cliente sea 0%.
+            tasa_iva_concepto = Decimal("0.16")
+        if c.iva_en_documento is not None and c.iva_en_documento != (tasa_iva_concepto > 0):
+            con_lo_capturado = "va exento" if iva_exento else ("lleva IVA" if tasa_iva_concepto > 0 else "no lleva IVA")
+            discrepancias_iva.append(
+                f"'{c.descripcion}': el documento {'cobra' if c.iva_en_documento else 'no cobra'} IVA, "
+                f"pero con lo capturado ({c.uso_inmueble or 'regla del cliente'}) {con_lo_capturado}"
+            )
         iva_concepto = _redondear((importe + ieps_concepto) * tasa_iva_concepto)
         iva_total += iva_concepto
         if tasa_iva_concepto > 0:
@@ -211,6 +229,14 @@ def calcular_factura(
             ieps_tasa=ieps_tasa_concepto,
             tasa_iva=tasa_iva_concepto,
             cuenta_predial=c.cuenta_predial,
+            iva_exento=iva_exento,
+            uso_inmueble=c.uso_inmueble,
+        ))
+
+    if discrepancias_iva and not omitir_validacion_cruzada:
+        return FiscalCalculationResult(escalation=EscalationDetail(
+            reason=EscalationReason.VALIDACION_ARITMETICA,
+            detail="IVA distinto al del documento fuente: " + "; ".join(discrepancias_iva),
         ))
 
     subtotal = sum((cc.importe for cc in conceptos_calculados), Decimal("0.00"))

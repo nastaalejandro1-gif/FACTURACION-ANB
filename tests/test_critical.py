@@ -351,8 +351,11 @@ def test_renta_de_inmueble_sin_cuenta_predial_se_rechaza():
     with pytest.raises(ValidationError, match="cuenta predial"):
         ConceptoDraft(descripcion="Renta casa", precio_unitario=8000, clave_prod_serv="NUEVA",
                       clave_prod_serv_propuesta="80131501", cuenta_predial=["  "])
+    with pytest.raises(ValidationError, match="uso_inmueble"):
+        ConceptoDraft(descripcion="Renta local", precio_unitario=10000, clave_prod_serv="80131500",
+                      cuenta_predial=["D65020110012"])
     c = ConceptoDraft(descripcion="Renta local", precio_unitario=10000, clave_prod_serv="80131502",
-                      cuenta_predial=[" D65020110012 "])
+                      cuenta_predial=[" D65020110012 "], uso_inmueble="otro")
     assert c.cuenta_predial == ["D65020110012"]
     # Otros conceptos no lo piden.
     assert ConceptoDraft(descripcion="Asesoria", precio_unitario=1, clave_prod_serv="84111500").cuenta_predial == []

@@ -337,3 +337,15 @@ def test_cuenta_predial_va_en_el_item():
     items = _build_facturapi_payload(_invoice(conceptos))["items"]
     assert items[0]["property_tax_account"] == ["D65020110012"]
     assert "property_tax_account" not in items[1]
+
+
+def test_concepto_exento_manda_iva_factor_exento_sin_retencion_de_iva():
+    conceptos = [ConceptoItem(descripcion="Renta casa", clave_prod_serv="80131500", cantidad=Decimal("1"),
+                              precio_unitario=Decimal("10000"), tasa_iva=Decimal("0"), iva_exento=True,
+                              cuenta_predial=["4U55241"])]
+    invoice_data = _invoice(conceptos, tasa_iva=Decimal("0.16"),
+                            retencion_isr=Decimal("125.00"), retencion_isr_tasa=Decimal("0.0125"))
+    taxes = _build_facturapi_payload(invoice_data)["items"][0]["product"]["taxes"]
+    assert {"type": "IVA", "rate": 0.0, "factor": "Exento", "withholding": False} in taxes
+    assert not any(t["type"] == "IVA" and t["withholding"] for t in taxes)
+    assert any(t["type"] == "ISR" and t["withholding"] for t in taxes)
