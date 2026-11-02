@@ -46,6 +46,7 @@ class ConceptoExtraido:
     cuenta_predial: tuple[str, ...] = ()
     uso_inmueble: Optional[str] = None  # ver models.ConceptoDraft.uso_inmueble
     iva_en_documento: Optional[bool] = None
+    iva_indicado: Optional[str] = None  # "16" / "0" / "exento" (lo dijo el cliente)
 
 
 @dataclass(frozen=True)
@@ -201,18 +202,25 @@ def calcular_factura(
         ieps_tasa_concepto = reglas.ieps_tasa if aplica_ieps else Decimal("0")
         ieps_concepto = _redondear(importe * ieps_tasa_concepto) if aplica_ieps else Decimal("0.00")
         tasa_iva_concepto = reglas.tasa_iva_por_clave.get(c.clave_prod_serv, tasa_iva)
-        # Renta de casa habitación sin amueblar: exenta (art. 20 fr. II LIVA).
-        iva_exento = c.uso_inmueble == "casa_habitacion"
-        if iva_exento:
+        # Renta de inmueble: el IVA que dijo el cliente, o el que corresponde
+        # al tipo de inmueble (casa habitación sin amueblar exenta, art. 20
+        # fr. II LIVA; amueblada, local u oficina gravada al 16%).
+        iva_exento = False
+        if c.iva_indicado is not None:
+            iva_exento = c.iva_indicado == "exento"
+            tasa_iva_concepto = Decimal("0.16") if c.iva_indicado == "16" else Decimal("0")
+        elif c.uso_inmueble == "casa_habitacion":
+            iva_exento = True
             tasa_iva_concepto = Decimal("0")
         elif c.uso_inmueble is not None and tasa_iva_concepto == 0:
-            # Amueblada, local u oficina: gravada aunque la regla del cliente sea 0%.
             tasa_iva_concepto = Decimal("0.16")
         if c.iva_en_documento is not None and c.iva_en_documento != (tasa_iva_concepto > 0):
             con_lo_capturado = "va exento" if iva_exento else ("lleva IVA" if tasa_iva_concepto > 0 else "no lleva IVA")
             discrepancias_iva.append(
                 f"'{c.descripcion}': el documento {'cobra' if c.iva_en_documento else 'no cobra'} IVA, "
-                f"pero con lo capturado ({c.uso_inmueble or 'regla del cliente'}) {con_lo_capturado}"
+                f"pero con lo capturado "
+                f"({f'IVA {c.iva_indicado}' if c.iva_indicado else c.uso_inmueble or 'regla del cliente'}) "
+                f"{con_lo_capturado}"
             )
         iva_concepto = _redondear((importe + ieps_concepto) * tasa_iva_concepto)
         iva_total += iva_concepto

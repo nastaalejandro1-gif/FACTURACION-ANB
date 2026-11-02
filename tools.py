@@ -193,18 +193,33 @@ def _invoice_tools(claves_enum: list[str]) -> list[dict]:
                                             "items": {"type": "string"},
                                             "description": (
                                                 "Número(s) de cuenta predial del inmueble, tal como los "
-                                                "dio el cliente. OBLIGATORIO si el concepto es renta de un "
-                                                "inmueble (claves 80131500-80131503); omítelo en los demás."
+                                                "dio el cliente. Solo en renta de un inmueble (claves "
+                                                "80131500-80131503); omítelo en los demás."
+                                            ),
+                                        },
+                                        "sin_cuenta_predial": {
+                                            "type": "boolean",
+                                            "description": (
+                                                "true SOLO si en renta de inmueble el cliente dijo "
+                                                "expresamente que no tiene cuenta predial."
+                                            ),
+                                        },
+                                        "iva_indicado": {
+                                            "type": "string",
+                                            "enum": ["16", "0", "exento"],
+                                            "description": (
+                                                "Solo en renta de inmueble: el IVA que el cliente DIJO para "
+                                                "esta línea (16%, tasa 0% o exento). Omítelo si no lo dijo."
                                             ),
                                         },
                                         "uso_inmueble": {
                                             "type": "string",
                                             "enum": ["casa_habitacion", "casa_amueblada", "otro"],
                                             "description": (
-                                                "OBLIGATORIO en renta de inmueble (claves 80131500-80131503): "
+                                                "Solo en renta de inmueble, si el cliente dijo qué es: "
                                                 "casa_habitacion = casa/departamento sin amueblar (IVA exento); "
-                                                "casa_amueblada; otro = local, oficina, bodega, terreno, etc. "
-                                                "Lo decide lo que diga el cliente, no lo supongas."
+                                                "casa_amueblada (16%); otro = local, oficina, bodega, etc. (16%). "
+                                                "En renta hace falta este campo o iva_indicado."
                                             ),
                                         },
                                         "iva_en_documento": {

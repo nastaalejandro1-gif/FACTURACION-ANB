@@ -483,3 +483,26 @@ def test_iva_del_documento_distinto_al_del_inmueble_escala():
     assert calcular_factura([_renta("casa_habitacion", iva_en_documento=True)], RECEPTOR_PF,
                             REGLAS_RESICO_SERVICIOS, "PUE", "03",
                             omitir_validacion_cruzada=True).factura.iva == Decimal("0.00")
+
+
+def _renta_iva(iva_indicado, uso=None, iva_en_documento=None):
+    return ConceptoExtraido("Renta", Decimal("1"), Decimal("10000"), "E48", "80131500",
+                            (), uso, iva_en_documento, iva_indicado)
+
+
+def test_iva_indicado_por_el_cliente_manda_sobre_el_tipo_de_inmueble():
+    f = calcular_factura([_renta_iva("exento", uso="otro")], RECEPTOR_PM, REGLAS_RESICO_SERVICIOS, "PUE", "03").factura
+    assert f.conceptos[0].iva_exento is True and f.iva == Decimal("0.00") and f.retencion_iva == Decimal("0.00")
+
+    f = calcular_factura([_renta_iva("0")], RECEPTOR_PM, REGLAS_RESICO_SERVICIOS, "PUE", "03").factura
+    assert f.conceptos[0].iva_exento is False and f.conceptos[0].tasa_iva == Decimal("0")
+    assert f.iva == Decimal("0.00") and f.retencion_iva == Decimal("0.00")
+
+    f = calcular_factura([_renta_iva("16", uso="casa_habitacion")], RECEPTOR_PM, REGLAS_RESICO_SERVICIOS, "PUE", "03").factura
+    assert f.iva == Decimal("1600.00") and f.retencion_iva == Decimal("1066.67")
+
+
+def test_iva_indicado_distinto_al_documento_escala():
+    r = calcular_factura([_renta_iva("exento", iva_en_documento=True)], RECEPTOR_PF, REGLAS_RESICO_SERVICIOS, "PUE", "03")
+    assert r.escalation.reason == EscalationReason.VALIDACION_ARITMETICA
+    assert "IVA exento" in r.escalation.detail

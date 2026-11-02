@@ -26,6 +26,7 @@ from facturapi_client import (
     guardar_cliente, search_invoice_by_uuid,
 )
 from models import (
+    CLAVES_ARRENDAMIENTO_INMUEBLE,
     MOTIVOS_CANCELACION,
     CancelacionDraft,
     ClientProfile,
@@ -526,6 +527,15 @@ async def _perfil_de_pendiente(pending: dict, id_cliente_emisor: str = "") -> Op
 # Factura de ingreso — cálculo, escalamiento, confirmación del cliente
 # ---------------------------------------------------------------------------
 
+IVA_INDICADO_TEXTO = {"16": "16%", "0": "tasa 0%", "exento": "exento"}
+
+
+def _iva_de_linea(c: ConceptoItem) -> str:
+    if c.iva_exento:
+        return "exento"
+    return f"{((c.tasa_iva or Decimal('0')) * 100).normalize():f}%"
+
+
 USO_INMUEBLE_TEXTO = {
     "casa_habitacion": "casa habitación (IVA exento)",
     "casa_amueblada": "casa amueblada (IVA 16%)",
@@ -646,6 +656,7 @@ async def _calcular_y_procesar_factura(
             cuenta_predial=tuple(c.cuenta_predial),
             uso_inmueble=c.uso_inmueble,
             iva_en_documento=c.iva_en_documento,
+            iva_indicado=c.iva_indicado,
         )
         for c in draft.factura.conceptos
     ]
@@ -782,6 +793,8 @@ def _detalle_para_revision(
             f"• {e(c.descripcion)}\n"
             f"   {c.cantidad:g} {e(c.clave_unidad)} × ${c.precio_unitario:,.2f} = ${importe:,.2f} · Clave {e(clave)}"
             + (f"\n   Cuenta predial: {e(', '.join(c.cuenta_predial))}" if c.cuenta_predial else "")
+            + ("\n   Sin cuenta predial (el cliente dijo que no tiene)" if c.sin_cuenta_predial else "")
+            + (f"\n   IVA indicado: {IVA_INDICADO_TEXTO[c.iva_indicado]}" if c.iva_indicado else "")
             + (f"\n   Inmueble: {USO_INMUEBLE_TEXTO.get(c.uso_inmueble, c.uso_inmueble)}" if c.uso_inmueble else "")
         )
     if len(f.conceptos) > MAX_CONCEPTOS_EN_REVISION:
@@ -940,7 +953,8 @@ async def _solicitar_confirmacion_cliente(
     conceptos_texto = "\n".join(
         f"  • {c.descripcion} — {c.cantidad} x ${c.precio_unitario:,.2f}"
         + (f" (predial {', '.join(c.cuenta_predial)})" if c.cuenta_predial else "")
-        + (" — IVA exento" if c.iva_exento else "")
+        + (" (sin cuenta predial)" if c.clave_prod_serv in CLAVES_ARRENDAMIENTO_INMUEBLE and not c.cuenta_predial else "")
+        + (f" — IVA {_iva_de_linea(c)}" if c.clave_prod_serv in CLAVES_ARRENDAMIENTO_INMUEBLE else "")
         for c in f.conceptos
     )
     receptor = invoice_data.receptor

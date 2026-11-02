@@ -58,12 +58,16 @@ class ConceptoDraft(BaseModel):
     # encontró ninguna clave del catálogo que aplique al concepto.
     clave_prod_serv: str
     clave_prod_serv_propuesta: str = ""  # obligatorio si clave_prod_serv == "NUEVA"
-    # CuentaPredial del CFDI: obligatoria al facturar renta de un inmueble.
-    # Varía por inmueble, así que se pide en cada factura (decisión de ANB).
+    # CuentaPredial del CFDI en renta de un inmueble. Varía por inmueble, así
+    # que se pide en cada factura; si el cliente dice que no tiene, se factura
+    # sin ella (sin_cuenta_predial) — decisión de ANB.
     cuenta_predial: list[str] = Field(default_factory=list)
-    # Renta de inmueble: casa habitación sin amueblar va EXENTA de IVA (art. 20
-    # LIVA); amueblada, local u oficina, al 16%. La clave genérica 80131500 no
-    # lo distingue, así que se pregunta en cada factura.
+    sin_cuenta_predial: bool = False
+    # IVA de una renta (la clave genérica 80131500 no distingue casa de local).
+    # Sale de lo que diga el cliente: el IVA directo (iva_indicado) o el tipo
+    # de inmueble — casa habitación sin amueblar va EXENTA (art. 20 LIVA);
+    # amueblada, local u oficina, al 16%. Si dice ambos, gana iva_indicado.
+    iva_indicado: Optional[Literal["16", "0", "exento"]] = None
     uso_inmueble: Optional[Literal["casa_habitacion", "casa_amueblada", "otro"]] = None
     # Si el documento fuente muestra IVA en esta línea (True), dice "sin IVA" /
     # "exento" (False), o no lo indica (None). Solo verifica: el IVA lo decide
@@ -76,19 +80,29 @@ class ConceptoDraft(BaseModel):
         return [n.strip() for n in v if n and n.strip()]
 
     @model_validator(mode="after")
-    def validate_predial_en_arrendamiento(self) -> "ConceptoDraft":
+    def validate_renta_de_inmueble(self) -> "ConceptoDraft":
         clave = self.clave_prod_serv_propuesta if self.clave_prod_serv == "NUEVA" else self.clave_prod_serv
-        if clave in CLAVES_ARRENDAMIENTO_INMUEBLE and not self.cuenta_predial:
+        if clave not in CLAVES_ARRENDAMIENTO_INMUEBLE:
+            if self.iva_indicado is not None or self.uso_inmueble is not None:
+                raise ValueError(
+                    f"'{self.descripcion}': iva_indicado y uso_inmueble solo aplican a renta de "
+                    "inmuebles (claves 80131500-80131503). Quítalos: el IVA de este concepto sale "
+                    "de las reglas del cliente."
+                )
+            return self
+        if self.cuenta_predial:
+            self.sin_cuenta_predial = False
+        elif not self.sin_cuenta_predial:
             raise ValueError(
-                f"El concepto '{self.descripcion}' es renta de un inmueble (clave {clave}) y el CFDI "
-                "debe llevar el número de cuenta predial. Pídeselo al cliente sin llamar la "
-                "herramienta; NUNCA lo inventes."
+                f"El concepto '{self.descripcion}' es renta de un inmueble (clave {clave}): falta el "
+                "número de cuenta predial. Pídeselo al cliente sin llamar la herramienta; NUNCA lo "
+                "inventes. Si el cliente dice que no tiene, manda sin_cuenta_predial=true."
             )
-        if clave in CLAVES_ARRENDAMIENTO_INMUEBLE and self.uso_inmueble is None:
+        if self.iva_indicado is None and self.uso_inmueble is None:
             raise ValueError(
-                f"El concepto '{self.descripcion}' es renta de un inmueble (clave {clave}): falta "
-                "uso_inmueble. Pregúntale al cliente si es casa habitación sin amueblar, casa "
-                "amueblada, o local/oficina/otro, sin llamar la herramienta; no lo supongas."
+                f"El concepto '{self.descripcion}' es renta de un inmueble (clave {clave}): falta saber "
+                "su IVA. Pregúntale al cliente si lleva IVA 16%, 0% o exento (o si es casa habitación "
+                "o local/oficina), sin llamar la herramienta; no lo supongas."
             )
         return self
 

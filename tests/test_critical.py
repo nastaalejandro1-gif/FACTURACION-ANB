@@ -344,18 +344,28 @@ def test_precio_unitario_con_mas_de_dos_decimales_cuadra_con_el_motor():
     assert data.factura.monto_antes_impuestos == Decimal("12909.76")
 
 
-def test_renta_de_inmueble_sin_cuenta_predial_se_rechaza():
+def test_renta_de_inmueble_pide_predial_e_iva():
     from models import ConceptoDraft
+
+    def renta(**kw):
+        return ConceptoDraft(descripcion="Renta", precio_unitario=10000, clave_prod_serv="80131500", **kw)
+
+    # Sin predial ni aviso de que no tiene -> se pide.
     with pytest.raises(ValidationError, match="cuenta predial"):
-        ConceptoDraft(descripcion="Renta local", precio_unitario=10000, clave_prod_serv="80131502")
+        renta(iva_indicado="16")
     with pytest.raises(ValidationError, match="cuenta predial"):
-        ConceptoDraft(descripcion="Renta casa", precio_unitario=8000, clave_prod_serv="NUEVA",
-                      clave_prod_serv_propuesta="80131501", cuenta_predial=["  "])
-    with pytest.raises(ValidationError, match="uso_inmueble"):
-        ConceptoDraft(descripcion="Renta local", precio_unitario=10000, clave_prod_serv="80131500",
-                      cuenta_predial=["D65020110012"])
-    c = ConceptoDraft(descripcion="Renta local", precio_unitario=10000, clave_prod_serv="80131502",
-                      cuenta_predial=[" D65020110012 "], uso_inmueble="otro")
-    assert c.cuenta_predial == ["D65020110012"]
-    # Otros conceptos no lo piden.
+        renta(cuenta_predial=["  "], iva_indicado="16")
+    # El cliente dijo que no tiene -> se factura sin ella.
+    assert renta(sin_cuenta_predial=True, iva_indicado="exento").cuenta_predial == []
+    # Sin IVA indicado ni tipo de inmueble -> se pregunta.
+    with pytest.raises(ValidationError, match="IVA 16%, 0% o exento"):
+        renta(cuenta_predial=["D65020110012"])
+    # Cualquiera de los dos basta.
+    assert renta(cuenta_predial=[" D65020110012 "], iva_indicado="0").cuenta_predial == ["D65020110012"]
+    assert renta(cuenta_predial=["D65020110012"], uso_inmueble="otro").iva_indicado is None
+    # Con predial, sin_cuenta_predial se ignora.
+    assert renta(cuenta_predial=["X1"], sin_cuenta_predial=True, iva_indicado="16").sin_cuenta_predial is False
+    # Otros conceptos: nada de esto, y no aceptan IVA indicado.
     assert ConceptoDraft(descripcion="Asesoria", precio_unitario=1, clave_prod_serv="84111500").cuenta_predial == []
+    with pytest.raises(ValidationError, match="solo aplican a renta"):
+        ConceptoDraft(descripcion="Asesoria", precio_unitario=1, clave_prod_serv="84111500", iva_indicado="exento")

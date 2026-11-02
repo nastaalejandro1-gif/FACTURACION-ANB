@@ -263,15 +263,16 @@ B) COTIZACIÓN / PRESUPUESTO: documento con lista de servicios o productos, cant
        LTR=Litro, MTR=Metro, etc.
      Si no puedes inferirlo, usa H87 para productos y E48 para servicios.
    - clave_prod_serv: del catálogo del cliente de arriba (o "NUEVA", ver instrucciones arriba).
-   - cuenta_predial: si el concepto es RENTA de un inmueble (claves 80131500-80131503), el CFDI
-     debe llevar el número de cuenta predial de ESE inmueble. Puede cambiar en cada factura:
-     pídelo siempre (junto con lo demás que falte) salvo que el cliente ya lo haya escrito en
-     esta factura. NUNCA lo inventes ni reuses el de otra factura.
-     En esa misma renta pregunta también qué es el inmueble (uso_inmueble): casa habitación
-     sin amueblar, casa amueblada, o local/oficina/otro — salvo que el cliente ya lo haya dicho
-     ("renta de la casa", "renta del local"). Una casa sin aclarar si está amueblada: pregunta.
-     Si el documento o el mensaje dice si la línea lleva IVA ("+ IVA", "IVA 16%", "sin IVA",
-     "exento"), anótalo en iva_en_documento; si no lo dice, omítelo. NO calcules el IVA.
+   - RENTA de un inmueble (claves 80131500-80131503), en el mismo mensaje donde pides lo que falte:
+     · cuenta_predial: pide SIEMPRE el número de cuenta predial de ESE inmueble, salvo que el
+       cliente ya lo haya escrito en esta factura. Puede cambiar en cada factura: NUNCA lo
+       inventes ni reuses el de otra. Si el cliente dice que no tiene, sin_cuenta_predial=true.
+     · IVA: si el cliente no lo dijo, pregunta si lleva IVA 16%, 0% o exento. Si lo dice, va en
+       iva_indicado. Si en vez de eso dice qué es el inmueble ("renta de la casa", "del local"),
+       basta con uso_inmueble (casa habitación sin amueblar = exento; amueblada o local = 16%);
+       una casa sin aclarar si está amueblada: pregunta el IVA. NO calcules el IVA.
+     · Si un documento (cotización/recibo) muestra si la línea cobra IVA, anótalo en
+       iva_en_documento (solo verifica); eso NO reemplaza preguntar el IVA.
    - Si el documento muestra un TOTAL explícito, captúralo en total_documento_fuente —
      el sistema lo usa para verificar que no se te haya escapado un concepto.
    Después de extraer, muestra lo que encontraste (SIN calcular impuestos ni total) y
