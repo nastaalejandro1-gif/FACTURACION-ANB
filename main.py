@@ -90,7 +90,7 @@ async def webhook(
 
 # Límite por chat para proteger el costo de Claude (un bucle o alguien
 # mandando mensajes sin parar). En memoria: el bot corre en una sola réplica.
-LIMITE_MENSAJES = 20
+LIMITE_MENSAJES = 60
 VENTANA_LIMITE_SEG = 600
 _mensajes_recientes: dict[str, deque] = defaultdict(deque)
 _ultimo_aviso_limite: dict[str, float] = {}
